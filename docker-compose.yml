@@ -1,0 +1,75 @@
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: chat_summary
+      MYSQL_USER: chat
+      MYSQL_PASSWORD: chatpass
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-prootpass"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:5.0.3
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # FastAPI 查询服务（仅读结果）
+  api:
+    build: .
+    image: chatsummary:latest
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # 造数据（一次性）：docker compose run --rm seed
+  seed:
+    image: chatsummary:latest
+    env_file: .env
+    command: python scripts/seed_data.py --date ${RUN_DATE:-2026-06-27} --customers ${CUSTOMERS:-300}
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    profiles: ["tools"]
+
+  # 批处理流水线（一次性）：docker compose run --rm pipeline
+  pipeline:
+    image: chatsummary:latest
+    env_file: .env
+    command: python scripts/run_pipeline.py --date ${RUN_DATE:-2026-06-27} ${PIPELINE_ARGS:-}
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    profiles: ["tools"]
+
+volumes:
+  mysql_data:

@@ -1,0 +1,35 @@
+[project]
+name = "chat-summary"
+version = "0.1.0"
+description = "客户经理每日聊天热点总结 —— 基于 BERTopic 的每日批量主题挖掘流水线"
+requires-python = ">=3.10"
+dependencies = [
+    "bertopic>=0.16,<0.17",        # 带 umap-learn / hdbscan / sentence-transformers
+    "scikit-learn>=1.3",
+    "jieba>=0.42",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "numpy>=1.24,<2.0",
+    "openai>=1.30",                # DeepSeek + SiliconFlow bge-m3 (OpenAI 兼容)
+    "SQLAlchemy>=2.0",
+    "PyMySQL>=1.1",
+    "redis>=5.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "Faker>=25.0",                 # 造模拟数据
+    "boto3>=1.34",                 # s3 向量后端（本地默认 local 不用）
+    "tenacity>=8.2",               # 外部 API 重试
+]
+
+[project.optional-dependencies]
+# 真正的可选 extra：GPU 路径。CPU 版 umap/hdbscan 随 bertopic 一起装。
+gpu = []  # 占位：cuml(RAPIDS) 仅能经 conda/容器镜像安装，见 README。
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
