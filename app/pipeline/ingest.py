@@ -1,6 +1,13 @@
-"""步骤 1：从 MySQL 分片读取当日消息（§5.1，IO 型，可分片并行）。
+"""步骤 1：从分表读取当日聊天（§5.1，IO 型）。
 
-本地 MVP 单进程顺序分片读取；K8s 下可按 id 区间分给多 worker。
+聊天记录按 from_user 分 20 张表 user_chat_record_sharding_1..20（见 app/sharding.py）。
+**关键**：分表键 = from_user，而我们按客户(from_user)聚合会话，所以同一客户的消息
+必在同一张分表 → 可**逐分表独立流式读取与聚合，无需跨分表全局排序**（也是天然的
+并行/多 pod 工作单元）。
+
+角色判定：新表无 role 列，按企业微信账号格式区分——外部联系人(微信客户)的
+external_userid 以 wm/wo 开头(EXTERNAL_ID_PREFIXES)，企业成员(客户经理)是 userid(工号)。
+只有客户侧文本消息进入热点分析。
 """
 from __future__ import annotations
 
@@ -8,122 +15,62 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterator
 
-from sqlalchemy import select, text
+from sqlalchemy import text
 
-from app.db import get_engine, get_session
-from app.models import Message
-
-# 取数查询的复合索引：WHERE role,msg_type,msg_time范围 + ORDER BY sender,receiver,msg_time,id。
-# 没有它，当天百万行会走全量 filesort（DB 端临时排序）。等值列(role,msg_type)在前，
-# 其后 sender,receiver,msg_time,id 与 ORDER BY 完全对齐 → 索引序扫描，免 filesort。
-# 注：messages 多日累积时建议再按 msg_time 做日期分区，让日期过滤先做分区裁剪。
-_INGEST_INDEX = "idx_ingest_order"
-_index_checked = False
-
-
-def ensure_indexes() -> None:
-    """幂等创建取数复合索引（MySQL 8 不支持 ADD INDEX IF NOT EXISTS）。"""
-    global _index_checked
-    if _index_checked:
-        return
-    engine = get_engine()
-    with engine.begin() as conn:
-        exists = conn.execute(
-            text(
-                "SELECT COUNT(*) FROM information_schema.statistics "
-                "WHERE table_schema = DATABASE() AND table_name = 'messages' "
-                "AND index_name = :idx"
-            ),
-            {"idx": _INGEST_INDEX},
-        ).scalar()
-        if not exists:
-            conn.execute(
-                text(
-                    f"ALTER TABLE messages ADD INDEX {_INGEST_INDEX} "
-                    "(role, msg_type, sender, receiver, msg_time, id)"
-                )
-            )
-    _index_checked = True
+from app.config import get_settings
+from app.db import get_session
+from app.sharding import all_shard_tables
 
 
 @dataclass
 class RawMessage:
     id: int
-    sender: str
-    receiver: str
-    role: str
+    sender: str        # from_user（发送方）
+    receiver: str      # to_user（接收方）
+    role: str          # customer | staff（由 from_user 前缀推导）
     msg_type: str
     content: str
     msg_time: datetime
 
 
-def iter_messages(date_str: str, shard_size: int = 5000) -> Iterator[RawMessage]:
-    """按主键分片流式读取当日消息，内存只占一个分片。"""
-    start = f"{date_str} 00:00:00"
-    end = f"{date_str} 23:59:59"
-    session = get_session()
-    try:
-        last_id = 0
-        while True:
-            rows = session.execute(
-                select(Message)
-                .where(
-                    Message.msg_time >= start,
-                    Message.msg_time <= end,
-                    Message.id > last_id,
-                )
-                .order_by(Message.id)
-                .limit(shard_size)
-            ).scalars().all()
-            if not rows:
-                break
-            for m in rows:
-                yield RawMessage(
-                    id=m.id,
-                    sender=m.sender,
-                    receiver=m.receiver,
-                    role=m.role,
-                    msg_type=m.msg_type,
-                    content=m.content,
-                    msg_time=m.msg_time,
-                )
-            last_id = rows[-1].id
-    finally:
-        session.close()
+def _customer_prefixes() -> tuple[str, ...]:
+    return tuple(
+        p.strip() for p in get_settings().external_id_prefixes.split(",") if p.strip()
+    )
+
+
+def _is_customer(from_user: str) -> bool:
+    # 外部联系人(微信客户) external_userid 以 wm/wo 开头；企业成员(工号)则否
+    return from_user.startswith(_customer_prefixes())
 
 
 def iter_customer_messages(date_str: str, yield_per: int = 2000) -> Iterator[RawMessage]:
-    """流式读取当日**客户侧文本**消息，按 (客户, 客户经理, 时间) 排序。
+    """流式读取当日**客户侧文本**消息。
 
-    用 MySQL 服务端游标（stream_results + yield_per）拉取，进程内存只占 yield_per
-    行，避免把百万级消息一次性读进内存。排序保证同一 (客户,经理) 对的消息连续，
-    供下游会话聚合按边界即时切分（§5.2 / 技术优化1）。
+    逐分表用服务端游标（stream_results + yield_per）拉取，每张表按
+    (from_user, to_user, msg_time, id) 排序，保证同一 (客户,经理) 对消息连续，
+    供下游会话聚合按边界即时切分。跨分表顺序无关（同一客户不跨表）。
     """
-    ensure_indexes()
-    start = f"{date_str} 00:00:00"
-    end = f"{date_str} 23:59:59"
-    stmt = (
-        select(Message)
-        .where(
-            Message.msg_time >= start,
-            Message.msg_time <= end,
-            Message.role == "customer",
-            Message.msg_type == "text",
-        )
-        .order_by(Message.sender, Message.receiver, Message.msg_time, Message.id)
-        .execution_options(yield_per=yield_per)  # 触发服务端流式游标
-    )
-    session = get_session()
-    try:
-        for m in session.execute(stmt).scalars():
-            yield RawMessage(
-                id=m.id,
-                sender=m.sender,
-                receiver=m.receiver,
-                role=m.role,
-                msg_type=m.msg_type,
-                content=m.content,
-                msg_time=m.msg_time,
-            )
-    finally:
-        session.close()
+    for tbl in all_shard_tables():
+        stmt = text(
+            f"SELECT id, from_user, to_user, msg_type, content, msg_time "
+            f"FROM `{tbl}` "
+            f"WHERE create_date = :d AND msg_type = 'text' "
+            f"ORDER BY from_user, to_user, msg_time, id"
+        ).execution_options(yield_per=yield_per, stream_results=True)
+        session = get_session()
+        try:
+            for r in session.execute(stmt, {"d": date_str}):
+                if not _is_customer(r.from_user):  # 只要客户侧
+                    continue
+                yield RawMessage(
+                    id=r.id,
+                    sender=r.from_user,
+                    receiver=r.to_user,
+                    role="customer",
+                    msg_type=r.msg_type,
+                    content=r.content,
+                    msg_time=r.msg_time,
+                )
+        finally:
+            session.close()

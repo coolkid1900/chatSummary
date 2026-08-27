@@ -7,24 +7,10 @@ CREATE DATABASE IF NOT EXISTS chat_summary
 
 USE chat_summary;
 
--- ===== 原始消息表：企业微信聊天存档字段 =====
-CREATE TABLE IF NOT EXISTS messages (
-  id        BIGINT       NOT NULL AUTO_INCREMENT,
-  msg_id    VARCHAR(64)  NOT NULL,
-  sender    VARCHAR(64)  NOT NULL,             -- 发送方（客户经理工号 / 客户外部 ID）
-  receiver  VARCHAR(64)  NOT NULL,             -- 接收方
-  role      VARCHAR(16)  NOT NULL,             -- staff | customer
-  msg_type  VARCHAR(16)  NOT NULL,             -- text|image|voice|file|emotion|system
-  content   TEXT         NOT NULL,
-  msg_time  DATETIME     NOT NULL,
-  PRIMARY KEY (id),
-  KEY idx_msg_id (msg_id),
-  KEY idx_sender (sender),
-  KEY idx_msg_time (msg_time),
-  KEY idx_msg_time_role (msg_time, role),
-  -- 取数查询专用：等值(role,msg_type) + ORDER BY sender,receiver,msg_time,id 走索引序，免 filesort
-  KEY idx_ingest_order (role, msg_type, sender, receiver, msg_time, id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+-- ===== 原始聊天记录 =====
+-- 聊天记录按 from_user 分 20 张表 user_chat_record_sharding_1..20（分表键 from_user，
+-- 路由=Java String.hashCode）。这些分表由应用启动时 app/sharding.ensure_shard_tables()
+-- 按业务方 DDL 幂等创建（CREATE TABLE IF NOT EXISTS），不在此处建。
 
 -- ===== 每日热点结果表（§13）=====
 CREATE TABLE IF NOT EXISTS daily_hot_topics (

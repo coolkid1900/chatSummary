@@ -1,4 +1,8 @@
-"""ORM 模型：原始聊天消息（企微聊天存档字段）+ 每日热点结果表。"""
+"""ORM 模型：结果表 + 运行状态 + 词库。
+
+原始聊天记录在 20 张分表 user_chat_record_sharding_*（见 app/sharding.py），
+由业务方/DBA 统一建表，应用不建表（本地开发建表见 sql/shard_tables.sql）。
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -19,26 +23,6 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase):
     pass
-
-
-class Message(Base):
-    """企业微信聊天存档消息。非文本类（图片/语音/文件/表情/系统）不参与 embedding。"""
-
-    __tablename__ = "messages"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    msg_id: Mapped[str] = mapped_column(String(64), index=True)
-    # 发送方=客户经理工号 / 接收方=客户外部联系人；role 区分 staff / customer
-    sender: Mapped[str] = mapped_column(String(64), index=True)
-    receiver: Mapped[str] = mapped_column(String(64), index=True)
-    role: Mapped[str] = mapped_column(String(16))  # staff | customer
-    msg_type: Mapped[str] = mapped_column(String(16))  # text|image|voice|file|emotion|system
-    content: Mapped[str] = mapped_column(Text)
-    msg_time: Mapped[datetime] = mapped_column(DateTime, index=True)
-
-    __table_args__ = (
-        Index("idx_msg_time_role", "msg_time", "role"),
-    )
 
 
 class DailyHotTopic(Base):

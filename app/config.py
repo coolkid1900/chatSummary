@@ -13,6 +13,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # 聊天记录分表（分表键 from_user，路由=Java hashCode，见 app/sharding.py）
+    shard_count: int = 20
+    shard_table_prefix: str = "user_chat_record_sharding_"
+    # 角色判定（企业微信会话存档）：企业成员(客户经理)的 from/to 是 userid(工号)，
+    # 外部联系人(微信客户)是 external_userid，以 wm/wo 开头（机器人 wb）。
+    # 故 from_user 以下列任一前缀开头即视为客户(customer)，否则为客户经理(staff)。
+    external_id_prefixes: str = "wm,wo"
+
     # MySQL
     mysql_host: str = "mysql"
     mysql_port: int = 3306

@@ -17,14 +17,32 @@ from __future__ import annotations
 import argparse
 import random
 import re
+import string
 from datetime import datetime, timedelta
 
 from faker import Faker
+from sqlalchemy import text
 
-from app.db import get_engine, get_session
-from app.models import Base, Message
+from app.db import get_session
+from app.sharding import all_shard_tables, shard_index
 
 fake = Faker("zh_CN")
+
+# 账号格式（对齐企业微信会话存档）：
+#  - 客户经理(企业成员) = userid(工号)，本行按需求用 8 位字符串；
+#  - 微信客户(外部联系人) = external_userid，以 wm 开头，约 32 位 base64url 串。
+_EXT_ALPHABET = string.ascii_letters + string.digits + "-_"
+_CUSTOMER_PREFIXES = ("wm", "wo")
+
+
+def _staff_id() -> str:
+    """8 位工号（数字字符串）。"""
+    return f"{random.randint(10000000, 99999999)}"
+
+
+def _external_userid() -> str:
+    """微信客户 external_userid：wm + 30 位 base64url 字符（共 32 位）。"""
+    return "wm" + "".join(random.choices(_EXT_ALPHABET, k=30))
 
 # ---- 占位符取值池：运行时随机填充，制造文本多样性 ----
 SLOTS = {
@@ -238,32 +256,38 @@ def _fill(template: str) -> str:
     return _SLOT_RE.sub(lambda m: random.choice(SLOTS[m.group(1)]), template)
 
 
-def init_tables() -> None:
-    Base.metadata.create_all(get_engine())
+def _mk(seq, from_user, to_user, msg_type, content, t) -> dict:
+    """构造一行分表记录（字段对齐 user_chat_record_sharding_* DDL）。"""
+    return {
+        "msg_id": f"M{t:%Y%m%d}{seq:08d}",
+        "content": content,
+        "create_date": t.date(),
+        "msg_time": t,
+        "msg_time_long": int(t.timestamp() * 1000),
+        "from_user": from_user,
+        "to_user": to_user,
+        "room_id": None,          # 单聊
+        "msg_type": msg_type,
+        "db_time": t,
+        "msg_body": content,
+        "action_text": None,
+        "scene": "single",
+    }
 
 
-def _mk(seq, sender, receiver, role, msg_type, content, t) -> Message:
-    return Message(
-        msg_id=f"M{t:%Y%m%d}{seq:08d}",
-        sender=sender,
-        receiver=receiver,
-        role=role,
-        msg_type=msg_type,
-        content=content,
-        msg_time=t,
-    )
-
-
-def gen_messages(date_str: str, num_customers: int) -> list[Message]:
+def gen_messages(date_str: str, num_customers: int) -> list[dict]:
     base_day = datetime.strptime(date_str, "%Y-%m-%d")
     scenarios = list(SCENARIO_WEIGHTS.keys())
     weights = list(SCENARIO_WEIGHTS.values())
-    msgs: list[Message] = []
+    msgs: list[dict] = []
     seq = 0
 
+    # 固定一批客户经理工号（约 30 人），多个客户复用（避免与场景回复模板 staff_pool 重名）
+    staff_ids = [_staff_id() for _ in range(30)]
+
     for c in range(num_customers):
-        staff = f"RM{random.randint(1, 30):03d}"
-        customer = f"EXT{c:05d}"
+        staff = random.choice(staff_ids)
+        customer = _external_userid()
         scenario = random.choices(scenarios, weights=weights, k=1)[0]
         cust_pool = SCENARIOS[scenario]["cust"]
         staff_pool = SCENARIOS[scenario]["staff"]
@@ -278,33 +302,31 @@ def gen_messages(date_str: str, num_customers: int) -> list[Message]:
         if random.random() < 0.4:
             t += timedelta(seconds=random.randint(20, 90))
             seq += 1
-            msgs.append(_mk(seq, customer, staff, "customer", "text",
-                            random.choice(CHITCHAT), t))
+            msgs.append(_mk(seq, customer, staff, "text", random.choice(CHITCHAT), t))
 
         for tmpl in chosen:
             line = random.choice(OPENERS) + _fill(tmpl)
             t += timedelta(seconds=random.randint(30, 180))
             seq += 1
-            msgs.append(_mk(seq, customer, staff, "customer", "text", line, t))
+            msgs.append(_mk(seq, customer, staff, "text", line, t))
 
             # 偶尔插入非文本噪声
             if random.random() < 0.15:
                 mt, body = random.choice(NON_TEXT)
                 t += timedelta(seconds=random.randint(10, 60))
                 seq += 1
-                msgs.append(_mk(seq, customer, staff, "customer", mt, body, t))
+                msgs.append(_mk(seq, customer, staff, mt, body, t))
 
-            # 客服回复（不参与客户侧聚合，仅作真实语料）
+            # 客服回复（from_user=staff → 路由到 staff 的分表，热点分析会过滤掉）
             t += timedelta(seconds=random.randint(30, 180))
             seq += 1
-            msgs.append(_mk(seq, staff, customer, "staff", "text", _fill(random.choice(staff_pool)), t))
+            msgs.append(_mk(seq, staff, customer, "text", _fill(random.choice(staff_pool)), t))
 
         # 结尾寒暄（噪声）
         if random.random() < 0.6:
             t += timedelta(seconds=random.randint(20, 120))
             seq += 1
-            msgs.append(_mk(seq, customer, staff, "customer", "text",
-                            random.choice(CLOSERS), t))
+            msgs.append(_mk(seq, customer, staff, "text", random.choice(CLOSERS), t))
 
     return msgs
 
@@ -319,24 +341,42 @@ def main() -> None:
     if args.seed is not None:
         random.seed(args.seed)
 
-    init_tables()
     msgs = gen_messages(args.date, args.customers)
+
+    # 按 from_user 路由到各分表（同一 from_user 必落同一表）
+    by_shard: dict[int, list[dict]] = {}
+    for r in msgs:
+        by_shard.setdefault(shard_index(r["from_user"]), []).append(r)
+
+    prefix = all_shard_tables()[0].rstrip("1")  # user_chat_record_sharding_
+    insert_cols = ("msg_id, content, create_date, msg_time, msg_time_long, from_user, "
+                   "to_user, room_id, msg_type, db_time, msg_body, action_text, scene")
+    insert_vals = (":msg_id, :content, :create_date, :msg_time, :msg_time_long, :from_user, "
+                   ":to_user, :room_id, :msg_type, :db_time, :msg_body, :action_text, :scene")
 
     session = get_session()
     try:
-        session.query(Message).filter(
-            Message.msg_time >= f"{args.date} 00:00:00",
-            Message.msg_time <= f"{args.date} 23:59:59",
-        ).delete(synchronize_session=False)
-        session.bulk_save_objects(msgs)
+        # 清当日旧数据（每张分表），便于重复 seed
+        for tbl in all_shard_tables():
+            session.execute(text(f"DELETE FROM `{tbl}` WHERE create_date = :d"), {"d": args.date})
+        # 分表批量插入
+        for shard, rows in by_shard.items():
+            tbl = f"{prefix}{shard}"
+            session.execute(
+                text(f"INSERT INTO `{tbl}` ({insert_cols}) VALUES ({insert_vals})"), rows
+            )
         session.commit()
     finally:
         session.close()
 
     # 统计唯一客户侧文本占比，直观体现「减少重复」
-    cust_texts = [m.content for m in msgs if m.role == "customer" and m.msg_type == "text"]
+    cust_texts = [
+        r["content"] for r in msgs
+        if r["from_user"].startswith(_CUSTOMER_PREFIXES) and r["msg_type"] == "text"
+    ]
     uniq = len(set(cust_texts))
-    print(f"[seed] 写入 {len(msgs)} 条消息 (date={args.date}, customers={args.customers}); "
+    print(f"[seed] 写入 {len(msgs)} 条消息到 {len(by_shard)} 张分表 "
+          f"(date={args.date}, customers={args.customers}); "
           f"客户文本 {len(cust_texts)} 条, 其中唯一 {uniq} 条")
 
 

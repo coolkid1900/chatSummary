@@ -26,6 +26,18 @@ def _read_seed_file(kind: str) -> list[str]:
         return [line.strip() for line in f if line.strip()]
 
 
+def _dedup_ci(words: list[str]) -> list[str]:
+    """按大小写不敏感去重（lexicon 唯一键在 utf8mb4 下大小写不敏感，OK/ok 视为冲突）。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    for w in words:
+        key = w.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(w)
+    return out
+
+
 def _ensure_table() -> None:
     Base.metadata.create_all(get_engine())
 
@@ -38,9 +50,9 @@ def seed_if_empty() -> None:
         for kind in KINDS:
             count = session.query(Lexicon.id).filter(Lexicon.kind == kind).count()
             if count == 0:
-                words = _read_seed_file(kind)
+                words = _dedup_ci(_read_seed_file(kind))
                 session.add_all(
-                    Lexicon(kind=kind, word=w, enabled=True) for w in dict.fromkeys(words)
+                    Lexicon(kind=kind, word=w, enabled=True) for w in words
                 )
         session.commit()
     finally:
