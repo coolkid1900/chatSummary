@@ -44,6 +44,7 @@ curl -X POST http://localhost:8000/seed-data \
 也可通过 HTTP 触发批处理（默认跑上一天，可指定日期）：
 ```bash
 curl -X POST http://localhost:8000/pipeline/run -d '{"date":"2026-06-27"}'
+curl -X POST http://localhost:8000/pipeline/run -d '{"date":"2026-06-27","force":true}' # 强制启动并重算
 curl http://localhost:8000/pipeline/runs/<run_id>   # 查运行状态
 ```
 

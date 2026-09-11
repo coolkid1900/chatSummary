@@ -94,7 +94,7 @@ def topics_by_date(date_str: str):
 
 class TriggerReq(BaseModel):
     date: str | None = None   # 默认上一天（昨天）
-    force: bool = False       # true 忽略已存在分片强制重嵌（不影响并发互斥）
+    force: bool = False       # true 覆盖运行锁并忽略已有分片，强制启动完整流水线
 
 
 class SeedDataReq(BaseModel):
@@ -106,12 +106,16 @@ class SeedDataReq(BaseModel):
 _RUN_LOCK_TTL = 7200  # 最长预期运行时间（秒），防止进程崩溃后锁永不释放
 
 
-def _acquire_run_lock(date_str: str, run_id: str) -> bool:
-    """原子占位：SET NX EX，检查与占位在同一个 Redis 命令内完成，消除竞态窗口。
-    返回 True 表示抢到锁（可以启动），False 表示该日期已有进程在跑。
+def _acquire_run_lock(date_str: str, run_id: str, force: bool = False) -> bool:
+    """获取日期运行锁；force=True 时原子覆盖已有锁并强制启动。
+
+    普通启动使用 SET NX EX 保证同日期互斥；强制启动使用 SET EX 抢占锁。
     """
     key = f"pipeline:lock:{date_str}"
-    return get_redis().set(key, run_id, nx=True, ex=_RUN_LOCK_TTL) is not None
+    redis = get_redis()
+    if force:
+        return redis.set(key, run_id, ex=_RUN_LOCK_TTL) is not None
+    return redis.set(key, run_id, nx=True, ex=_RUN_LOCK_TTL) is not None
 
 
 def _check_auth(token: str | None) -> None:
@@ -181,10 +185,9 @@ async def trigger_pipeline(
     target = _validate_date(req.date) if req.date else (date_cls.today() - timedelta(days=1)).isoformat()
 
     run_id = uuid.uuid4().hex[:12]
-    # 并发互斥与「是否强制重嵌」解耦：任何情况下同一日期都不允许两个 pipeline 并跑，
-    # force 仅控制重嵌（见 --force），不再跳过此处的锁。残留锁靠 TTL 自动过期，
-    # 需人工清理时 `redis-cli del pipeline:lock:{date}`。
-    if not _acquire_run_lock(target, run_id):
+    # 普通启动保持同日期互斥；force=true 时覆盖已有锁并立即启动，同时强制重嵌。
+    # RunState 只释放 run_id 与自己相同的锁，因此被抢占的旧任务不会误删新锁。
+    if not _acquire_run_lock(target, run_id, force=req.force):
         raise HTTPException(status_code=409, detail=f"{target} 已有正在运行的任务")
 
     # create_task 使 HTTP 请求立即返回；to_thread 保证同步重计算不阻塞事件循环。
