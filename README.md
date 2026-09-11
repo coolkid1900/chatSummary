@@ -10,14 +10,14 @@
 ## 架构
 
 ```
-[批处理 Pipeline] (scripts/run_pipeline.py)
+[批处理 Pipeline] (app/pipeline/run_pipeline.py)
   MySQL 取数 → 预处理/会话聚合/去重 → bge-m3 嵌入(Redis 限流+缓存, 分片 parquet)
   → 降维+聚类(CLUSTER_BACKEND 切换) → c-TF-IDF 热词(jieba) → DeepSeek 意图概括
   → 写回 MySQL + Redis 缓存
 [FastAPI] (app/api/main.py)  ← 仅读已算好的结果
 ```
 
-模块对应：`app/pipeline/{ingest,preprocess,ratelimit,embedding,vector_store,cluster,tokenizer,hotwords,intent,persist}.py`
+模块对应：`app/pipeline/{run_pipeline,ingest,preprocess,ratelimit,embedding,vector_store,cluster,tokenizer,hotwords,intent,persist}.py`
 
 ## 快速开始（OrbStack）
 
@@ -32,6 +32,14 @@ make pipeline                 # 跑端到端流水线（真实 API，需 .env �
 curl http://localhost:8000/topics/2026-06-27 | jq    # 查热点
 curl http://localhost:8000/topics/today | jq
 ```
+
+也可通过 API 覆盖写入某日的模拟聊天数据：
+```bash
+curl -X POST http://localhost:8000/seed-data \
+  -H 'Content-Type: application/json' \
+  -d '{"date":"2026-06-27","customers":300,"seed":42}'
+```
+该接口会先删除该日期已有的模拟聊天；随后重新跑该日期的热点统计时，请传入 `force=true`。
 
 也可通过 HTTP 触发批处理（默认跑上一天，可指定日期）：
 ```bash

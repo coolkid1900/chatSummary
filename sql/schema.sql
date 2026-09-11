@@ -34,3 +34,39 @@ CREATE TABLE IF NOT EXISTS daily_hot_topics (
   UNIQUE KEY uq_date_rank (stat_date, `rank`),
   KEY idx_stat_date (stat_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ===== 词库表 =====
+-- 维护业务词(term)、停用词(stopword)和寒暄词(chitchat)。
+CREATE TABLE IF NOT EXISTS lexicon (
+  id          BIGINT       NOT NULL AUTO_INCREMENT,
+  kind        VARCHAR(16)  NOT NULL,   -- term | stopword | chitchat
+  word        VARCHAR(128) NOT NULL,
+  enabled     TINYINT(1)   NOT NULL DEFAULT 1,  -- 软禁用标记
+  created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_kind_word (kind, word),
+  KEY idx_kind (kind)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ===== 流水线运行记录表 =====
+-- 保存每次热点统计任务的状态、规模及失败信息，供监控和排障使用。
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+  id                BIGINT       NOT NULL AUTO_INCREMENT,
+  run_id            VARCHAR(64)  NOT NULL,
+  stat_date         VARCHAR(10)  NOT NULL,   -- YYYY-MM-DD
+  status            VARCHAR(16)  NOT NULL,   -- running | success | failed
+  cluster_backend   VARCHAR(32)  NOT NULL DEFAULT '',
+  n_messages        INT          NOT NULL DEFAULT 0,
+  n_sessions        INT          NOT NULL DEFAULT 0,
+  n_topics          INT          NOT NULL DEFAULT 0,
+  embed_api_calls   INT          NOT NULL DEFAULT 0,
+  embed_cache_hits  INT          NOT NULL DEFAULT 0,
+  llm_failures      INT          NOT NULL DEFAULT 0,
+  duration_sec      FLOAT        NOT NULL DEFAULT 0,
+  error             TEXT         NOT NULL,
+  created_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_run_id (run_id),
+  KEY idx_stat_date (stat_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -48,7 +48,7 @@ services:
   seed:
     image: chatsummary:latest
     env_file: .env
-    command: python scripts/seed_data.py --date ${RUN_DATE:-2026-06-27} --customers ${CUSTOMERS:-300}
+    command: python -m app.api.seed_data --date ${RUN_DATE:-2026-06-27} --customers ${CUSTOMERS:-300}
     volumes:
       - ./data:/app/data
     depends_on:
@@ -62,7 +62,7 @@ services:
   pipeline:
     image: chatsummary:latest
     env_file: .env
-    command: python scripts/run_pipeline.py --date ${RUN_DATE:-2026-06-27} ${PIPELINE_ARGS:-}
+    command: python -m app.pipeline.run_pipeline --date ${RUN_DATE:-2026-06-27} ${PIPELINE_ARGS:-}
     volumes:
       - ./data:/app/data
     depends_on:

@@ -1,33 +1,34 @@
 """FastAPI 服务（§4）。
 
 - 查询接口：仅读已算好的结果（优先 Redis 缓存，未命中回查 MySQL），不在请求里现算。
-- 触发接口：POST /pipeline/run 不在请求内跑重计算，而是把 scripts/run_pipeline.py
-  作为**独立子进程**拉起（与 API 进程隔离），立即返回 run_id；用 /pipeline/runs/{run_id}
-  轮询状态。K8s 上更推荐让该接口去创建 Job；此处用子进程满足本地可跑通。
+- 触发接口：POST /pipeline/run 将同步流水线放到 asyncio 后台任务的工作线程执行，
+  立即返回 run_id；用 /pipeline/runs/{run_id} 轮询状态。
 """
 from __future__ import annotations
 
+import asyncio
 import json
-import subprocess
-import sys
+import logging
 import uuid
 from datetime import date as date_cls, datetime, timedelta
-from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.config import get_settings
 from app.db import get_session
 from app import lexicon
 from app.models import DailyHotTopic, PipelineRun
+from app.pipeline.run_pipeline import run as run_pipeline
 from app.redis_client import get_redis
+from app.api.seed_data import seed_data
 
 app = FastAPI(title="客户经理聊天热点总结", version="0.1.0")
+log = logging.getLogger(__name__)
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]  # /app
-_PIPELINE = _REPO_ROOT / "scripts" / "run_pipeline.py"
+# 保留强引用，确保 create_task 创建的任务在完成前不会被回收。
+_pipeline_tasks: set[asyncio.Task[None]] = set()
 
 
 def _from_db(date_str: str) -> list[dict]:
@@ -96,6 +97,12 @@ class TriggerReq(BaseModel):
     force: bool = False       # true 忽略已存在分片强制重嵌（不影响并发互斥）
 
 
+class SeedDataReq(BaseModel):
+    date: str | None = None
+    customers: int = Field(default=300, ge=1, le=100_000)
+    seed: int | None = None
+
+
 _RUN_LOCK_TTL = 7200  # 最长预期运行时间（秒），防止进程崩溃后锁永不释放
 
 
@@ -139,8 +146,36 @@ def _run_to_dict(r: PipelineRun) -> dict:
     }
 
 
+@app.post("/seed-data")
+async def create_seed_data(
+    req: SeedDataReq = SeedDataReq(),
+    x_trigger_token: str | None = Header(default=None),
+):
+    """覆盖写入指定日期的模拟聊天数据，默认生成当天 300 个客户的会话。"""
+    _check_auth(x_trigger_token)
+    target = _validate_date(req.date) if req.date else date_cls.today().isoformat()
+    result = await asyncio.to_thread(seed_data, target, req.customers, req.seed)
+    return {
+        "status": "success",
+        **result,
+        "note": "模拟数据已写入；重新统计该日期时请使用 force=true。",
+    }
+
+
+async def _run_pipeline_in_background(date_str: str, force: bool, run_id: str) -> None:
+    """在线程中运行同步流水线，避免阻塞 FastAPI 的事件循环。"""
+    try:
+        await asyncio.to_thread(run_pipeline, date_str, force, run_id)
+    except Exception:
+        # run_pipeline 会将失败信息更新到 pipeline_runs；这里仅补充 API 日志。
+        log.exception("pipeline background task failed: run_id=%s", run_id)
+
+
 @app.post("/pipeline/run")
-def trigger_pipeline(req: TriggerReq = TriggerReq(), x_trigger_token: str | None = Header(default=None)):
+async def trigger_pipeline(
+    req: TriggerReq = TriggerReq(),
+    x_trigger_token: str | None = Header(default=None),
+):
     """触发批处理。默认处理**上一天**数据，可用 body.date 指定日期（YYYY-MM-DD）。"""
     _check_auth(x_trigger_token)
     target = _validate_date(req.date) if req.date else (date_cls.today() - timedelta(days=1)).isoformat()
@@ -152,11 +187,13 @@ def trigger_pipeline(req: TriggerReq = TriggerReq(), x_trigger_token: str | None
     if not _acquire_run_lock(target, run_id):
         raise HTTPException(status_code=409, detail=f"{target} 已有正在运行的任务")
 
-    cmd = [sys.executable, str(_PIPELINE), "--date", target, "--run-id", run_id]
-    if req.force:
-        cmd.append("--force")
-    # 独立子进程拉起，立即返回（不阻塞 HTTP / 不在 API 进程内做重计算）
-    subprocess.Popen(cmd, cwd=str(_REPO_ROOT))
+    # create_task 使 HTTP 请求立即返回；to_thread 保证同步重计算不阻塞事件循环。
+    task = asyncio.create_task(
+        _run_pipeline_in_background(target, req.force, run_id),
+        name=f"pipeline-{run_id}",
+    )
+    _pipeline_tasks.add(task)
+    task.add_done_callback(_pipeline_tasks.discard)
 
     return {"run_id": run_id, "date": target, "status": "started", "force": req.force}
 
