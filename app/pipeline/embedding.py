@@ -17,6 +17,7 @@ import numpy as np
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import get_settings
+from app.pipeline.embedding_input import EmbeddingInput
 from app.pipeline.ratelimit import TokenBucket
 from app.pipeline.preprocess import SessionUnit
 from app.redis_client import get_redis
@@ -30,6 +31,9 @@ class Embedder:
         self.bucket = TokenBucket("embedding", self.settings.embedding_rate_per_sec)
         self._client = None
         self._lock = threading.Lock()  # 保护并发下的计数
+        self.input = EmbeddingInput(
+            self.settings.embedding_max_input_chars
+        )
         # 统计
         self.api_calls = 0
         self.cache_hits = 0
@@ -46,7 +50,8 @@ class Embedder:
         return self._client
 
     def _cache_key(self, text_hash: str) -> str:
-        return f"emb:{self.settings.embedding_model}:{text_hash}"
+        return (f"emb:{self.settings.embedding_model}:chars-truncate-v1:"
+                f"{self.settings.embedding_max_input_chars}:{text_hash}")
 
     @retry(stop=stop_after_attempt(4), wait=wait_exponential(min=1, max=20))
     def _call_api(self, texts: list[str]) -> list[list[float]]:
@@ -103,12 +108,15 @@ class Embedder:
                     self.redis.delete(self._cache_key(h))
             misses.append(h)
 
+        # 按字符数截断请求文本；保留原会话和原文 hash。
+        prepared = {h: self.input.truncate(hash_to_text[h]) for h in misses}
+
         # 3) 未命中的批量调用：并发发请求（令牌桶把实际速率限在 m/s，打满限额）
         batch_size = self.settings.embedding_batch_size
         batches = [misses[i : i + batch_size] for i in range(0, len(misses), batch_size)]
 
         def _work(batch_hashes: list[str]) -> tuple[list[str], list[list[float]]]:
-            batch_texts = [hash_to_text[h] for h in batch_hashes]
+            batch_texts = [prepared[h] for h in batch_hashes]
             return batch_hashes, self._call_api(batch_texts)
 
         workers = max(1, self.settings.embedding_concurrency)

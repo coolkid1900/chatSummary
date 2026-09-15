@@ -8,6 +8,7 @@ from __future__ import annotations
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 
 
 class Settings(BaseSettings):
@@ -39,6 +40,7 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-m3"
     embedding_dim: int = 1024
     embedding_batch_size: int = 64
+    embedding_max_input_chars: int = Field(default=7500, gt=0)
     embedding_rate_per_sec: float = 4
     embedding_concurrency: int = 8  # 单 pod 内并发请求数，受令牌桶约束以打满 m/s
 

@@ -97,6 +97,14 @@ make pipeline-umap                          # umap_hdbscan
 `VECTOR_STORE_BACKEND` / `EMBEDDING_RATE_PER_SEC` / `LLM_RATE_PER_SEC` / `TOP_N` /
 `SESSION_GAP_MINUTES` / `NR_DOCS`。
 
+Embedding 单条输入由 `EMBEDDING_MAX_INPUT_CHARS=7500` 限制（正整数），
+使用 Python `len(text)` 判断长度，超长时保留前 N 个 Unicode 码点，短文本保持原样；
+空格、换行和标点也计入长度。无需 tokenizer 或下载分词文件。
+字符数不等于 token 数，此配置不能严格保证接口的 8K token 限制，可根据实际文本调低上限。
+原始脱敏会话仍完整保存；修改截断上限后，Redis 向量缓存及旧分片不再复用，
+后续运行会重新嵌入。每批仍最多 64 条，此参数不限制单批总长度。
+修改 `.env` 后重启进程；Compose 部署需重建镜像并重新创建容器以加载代码和配置。
+
 ## GPU（可选）
 
 CPU 版 umap/hdbscan 随 bertopic 安装。GPU 路径需 RAPIDS `cuml`（只能经 conda / nvidia

@@ -44,9 +44,9 @@ def build_models():
         )
     elif backend == "incremental":
         from sklearn.cluster import MiniBatchKMeans
-        from sklearn.decomposition import IncrementalPCA
+        from app.pipeline.reduction import Float32IncrementalPCA
 
-        dim_model = IncrementalPCA(n_components=n_components)
+        dim_model = Float32IncrementalPCA(n_components=n_components)
         cluster_model = MiniBatchKMeans(
             n_clusters=settings.n_clusters, random_state=42
         )

@@ -77,6 +77,8 @@ def _embed_config() -> dict:
         "pipeline_version": PIPELINE_VERSION,
         "embedding_model": settings.embedding_model,
         "embedding_dim": settings.embedding_dim,
+        "embedding_input_version": "chars-truncate-v1",
+        "embedding_max_input_chars": settings.embedding_max_input_chars,
         "min_text_len": settings.min_text_len,
         "session_gap_minutes": settings.session_gap_minutes,
         "chitchat_fingerprint": chitchat_fp,
