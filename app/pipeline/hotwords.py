@@ -1,7 +1,6 @@
 """步骤 7~8：热词产出 + 热度排序（§10.2）。
 
-c-TF-IDF 由 BERTopic 在 fit/partial_fit 时算好，get_topic(topic_id) 直接返回
-每主题 [(词, 权重), ...]。热度 = 该主题客户消息数（§13），归类阶段已流式累计。
+c-TF-IDF 按最终分组及合并后的词频统一计算。热度 = 该主题客户消息数（§13），归类阶段已流式累计。
 """
 from __future__ import annotations
 
@@ -30,7 +29,7 @@ def rank_topics(result: ClusterResult, top_words: int = 10) -> list[TopicHot]:
     for topic_id, heat in result.heat_by_topic.items():
         words = (
             result.hot_words_by_topic.get(topic_id)
-            or result.topic_model.get_topic(topic_id)
+            or (result.topic_model.get_topic(topic_id) if result.topic_model is not None else [])
             or []
         )
         hot_words = [(w, float(s)) for w, s in words[:top_words] if w]

@@ -3,5 +3,7 @@
 __pycache__
 *.pyc
 data/embeddings
+data/cluster-cache
+reports
 .env
 *.md

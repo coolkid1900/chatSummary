@@ -81,15 +81,60 @@ make pipeline-umap                          # umap_hdbscan
 ```
 两条路径都由 `CLUSTER_BACKEND` 环境变量决定，无需改码。
 
+## incremental 训练及质量验证
+
+incremental 先扫描全部向量训练 PCA，固定投影后将降维向量写入临时缓存，再分批训练
+MiniBatchKMeans，最后按最终标签统一计算热度、客户数、c-TF-IDF 和代表池。
+该路径按需加载依赖，不导入 BERTopic；代表向量独立复制，避免代表池间接保留整批原始向量。
+PCA 按训练批大小累积，文件分片边界不触发额外拟合；完整尾批不再被强行切成很小的一批。
+本地 parquet 及 S3 均按列、按批次读取，缓存完成或异常退出后自动清理。
+向量缓存约占 `会话数 × 降维维数 × 4` 字节磁盘；客户去重集合、词表仍随数据规模增长。
+
+合并使用**原始向量空间的全体会话质心**，每条会话等权。`TOPIC_MERGE_LINKAGE` 支持：
+
+| 配置 | 规则 | 特点 |
+|---|---|---|
+| `single`（通用默认） | 阈值图的连通分量 | 同类容易合并，但相似链条可能连接不同业务 |
+| `average` | 两组初始簇之间的平均余弦距离 | 初始簇等权，折中考虑整体相似度 |
+| `complete` | 两组初始簇之间的最大余弦距离 | 更严格，可能拆分同类业务 |
+
+`TOPIC_MERGE_SIM=0` 关闭合并，其余值对应距离阈值 `1-SIM`。不同规则必须分别调阈值。
+UMAP 可用 `UMAP_TOPIC_MERGE_LINKAGE` / `UMAP_TOPIC_MERGE_SIM` 独立覆盖；
+未设置时兼容继承 `TOPIC_MERGE_*`。本地 UMAP 保持 `single / 0.85`，不使用 incremental 的调参阈值。
+ARI 衡量与参考业务分组的一致性，同时惩罚误合并和同类拆分；它不是热点文案质量或准确率。
+
+本地 `.env` 使用经过 300～10,000 会话模拟数据验证的配置：
+
+```dotenv
+CLUSTER_BACKEND=incremental
+INCREMENTAL_N_COMPONENTS=32
+N_CLUSTERS=30
+INCREMENTAL_EPOCHS=1
+CLUSTER_RANDOM_SEED=42
+TOPIC_MERGE_LINKAGE=average
+TOPIC_MERGE_SIM=0.80
+```
+
+这些值是小型银行业务模拟集的验证配置，通用默认值仍见 `.env.example`。
+真实数据、更多业务类别、不同 embedding 或分片规模需要重新评估。
+
+正式回归测试覆盖流式聚类、合并策略、分片边界、统计一致性和缓存清理：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+评估真实数据时，应使用独立标注集，并检查不同训练批大小和样本顺序下的分组稳定性。
+
 ## 部署到 K8s 的注意点
 
 - **向量存储务必用 `VECTOR_STORE_BACKEND=s3`**（对象存储 / MinIO）：pod 本地盘 / emptyDir
   不跨 pod 共享且重启即丢，N 个 embedding worker 写的分片聚类 pod 读不到；普通 PVC 是
   ReadWriteOnce 无法多挂。对象存储天然跨 pod，过期交给 **bucket lifecycle** 规则（短 TTL）。
 - 分片文件名带 `WORKER_ID`（K8s 注入 pod 名），避免多 worker 并发写冲突。
-- 聚类 `fit` 单点不可并行，按内存条件选后端：2G pod 用 `incremental`；大内存/GPU 用
+- 聚类 `fit` 单点执行，按实测内存选择后端：内存受限时优先评估 `incremental`；大内存/GPU 用
   `umap_hdbscan`（对应文档 §6 方案 C，单独大内存 CronJob，16~32G）。
-- API pod 仅查结果，可保持 2G。
+- API pod 仅查结果。内存预算需包含运行时、客户集合和词表，不保证所有数据都能放入 2G。
 
 ## 环境变量
 

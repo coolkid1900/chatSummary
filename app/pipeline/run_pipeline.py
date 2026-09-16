@@ -1,6 +1,6 @@
 """端到端批处理流水线入口（§4 / §5）。
 
-每日批量主题挖掘（全程流式 / 分片，内存与单 batch 相关，2G pod 可跑）：
+每日批量主题挖掘（incremental 分批训练；客户集合和词表仍随数据增长）：
   MySQL 流式取数 → 预处理/会话聚合/PII脱敏 → bge-m3 嵌入(限流+缓存)
   → jieba 多进程分词 + 分片 parquet 落盘 → 降维+聚类(fit/transform分离)
   → c-TF-IDF 热词 → 代表文档 MMR 采样 → DeepSeek 意图概括+业务词
@@ -121,11 +121,16 @@ def run(date_str: str, force: bool, run_id: str | None = None) -> None:
 
         # 降维 + 聚类 + 归类（fit/transform 分离，流式累计热度与代表池）
         result = run_clustering(date_str)
-        n_sessions = sum(result._seen.values())
+        n_assigned = sum(result._seen.values())
+        n_sessions = int(result.metrics.get("n_sessions", n_assigned))
         if state.metrics["n_sessions"] == 0:
             state.set(n_sessions=n_sessions)
+        if state.metrics["n_messages"] == 0 and "n_messages" in result.metrics:
+            state.set(n_messages=int(result.metrics["n_messages"]))
         state.set(n_topics=result.n_topics)
-        log.info("聚类: %d 主题 (%d 会话已归类)", result.n_topics, n_sessions)
+        log.info("聚类: %d 主题 (%d/%d 会话已归类，%d 待归类)",
+                 result.n_topics, n_assigned, n_sessions,
+                 result.metrics.get("rejected_sessions", 0))
         if result.n_topics == 0:
             log.warning("无主题（可能无数据），结束。")
             state.success()

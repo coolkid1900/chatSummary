@@ -14,6 +14,7 @@ import io
 import json
 import os
 import shutil
+import tempfile
 from datetime import datetime, timedelta
 from typing import Iterator, TypedDict
 
@@ -118,17 +119,35 @@ def _to_table(records: list[Record]) -> pa.Table:
 
 
 def _table_to_batches(table: pa.Table, batch_size: int) -> Iterator[Batch]:
-    df = table.to_pandas()
-    for i in range(0, len(df), batch_size):
-        chunk = df.iloc[i : i + batch_size]
-        yield Batch(
-            session_id=chunk["session_id"].tolist(),
-            text=chunk["text"].tolist(),
-            tokens=chunk["tokens"].tolist(),
-            msg_count=chunk["msg_count"].tolist(),
-            customer=chunk["customer"].tolist(),
-            vectors=np.asarray(list(chunk["vector"]), dtype=np.float32),
-        )
+    for record_batch in table.to_batches(max_chunksize=batch_size):
+        yield _record_batch(record_batch)
+
+
+def _arrow_vectors(column: pa.Array) -> np.ndarray:
+    if column.null_count:
+        raise ValueError("向量列含空值")
+    lengths = np.diff(column.offsets.to_numpy())
+    if not len(lengths):
+        return np.empty((0, 0), dtype=np.float32)
+    if lengths[0] <= 0 or np.any(lengths != lengths[0]):
+        raise ValueError("向量维度不一致或为空")
+    values = column.flatten()
+    if values.null_count:
+        raise ValueError("向量元素含空值")
+    return np.asarray(values.to_numpy(zero_copy_only=False), dtype=np.float32).reshape(
+        len(column), int(lengths[0])
+    )
+
+
+def _record_batch(rb: pa.RecordBatch) -> Batch:
+    return Batch(
+        session_id=rb.column("session_id").to_pylist(),
+        text=rb.column("text").to_pylist(),
+        tokens=rb.column("tokens").to_pylist(),
+        msg_count=rb.column("msg_count").to_pylist(),
+        customer=rb.column("customer").to_pylist(),
+        vectors=_arrow_vectors(rb.column("vector")),
+    )
 
 
 class LocalVectorStore:
@@ -222,11 +241,21 @@ class LocalVectorStore:
 
     def iter_batches(self, date_str: str, batch_size: int | None = None) -> Iterator[Batch]:
         bs = batch_size or self.settings.cluster_batch_size
+        for rb in self._iter_record_batches(date_str, bs):
+            yield _record_batch(rb)
+
+    def iter_vector_batches(self, date_str: str, batch_size: int | None = None) -> Iterator[np.ndarray]:
+        bs = batch_size or self.settings.cluster_batch_size
+        for rb in self._iter_record_batches(date_str, bs, columns=["vector"]):
+            yield _arrow_vectors(rb.column("vector"))
+
+    def _iter_record_batches(self, date_str: str, bs: int, columns=None):
         d = self._dir(date_str)
         if not os.path.isdir(d):
             return
         for f in sorted(x for x in os.listdir(d) if x.endswith(".parquet")):
-            yield from _table_to_batches(pq.read_table(os.path.join(d, f)), bs)
+            with pq.ParquetFile(os.path.join(d, f)) as parquet:
+                yield from parquet.iter_batches(batch_size=bs, columns=columns)
 
     def cleanup_expired(self) -> None:
         if not os.path.isdir(self.base):
@@ -348,13 +377,26 @@ class S3VectorStore:
 
     def iter_batches(self, date_str: str, batch_size: int | None = None) -> Iterator[Batch]:
         bs = batch_size or self.settings.cluster_batch_size
-        paginator = self.client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=self._prefix(date_str)):
-            for obj in page.get("Contents", []):
-                if not obj["Key"].endswith(".parquet"):
-                    continue
-                body = self.client.get_object(Bucket=self.bucket, Key=obj["Key"])["Body"].read()
-                yield from _table_to_batches(pq.read_table(io.BytesIO(body)), bs)
+        for rb in self._iter_record_batches(date_str, bs):
+            yield _record_batch(rb)
+
+    def iter_vector_batches(self, date_str: str, batch_size: int | None = None) -> Iterator[np.ndarray]:
+        bs = batch_size or self.settings.cluster_batch_size
+        for rb in self._iter_record_batches(date_str, bs, columns=["vector"]):
+            yield _arrow_vectors(rb.column("vector"))
+
+    def _iter_record_batches(self, date_str: str, bs: int, columns=None):
+        # 与本地后端顺序一致；大对象溢出到临时磁盘，避免整片 bytes 常驻。
+        for key in self._shard_keys(date_str):
+            body = self.client.get_object(Bucket=self.bucket, Key=key)["Body"]
+            try:
+                with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as source:
+                    shutil.copyfileobj(body, source, length=1024 * 1024)
+                    source.seek(0)
+                    with pq.ParquetFile(source) as parquet:
+                        yield from parquet.iter_batches(batch_size=bs, columns=columns)
+            finally:
+                body.close()
 
     def cleanup_expired(self) -> None:
         # 交给 bucket lifecycle；此处不主动删，避免误删并发写入。

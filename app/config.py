@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
@@ -53,8 +54,16 @@ class Settings(BaseSettings):
 
     # 聚类后端（§6.0）
     cluster_backend: str = "incremental"  # incremental | umap_hdbscan
-    n_components: int = 10
-    n_clusters: int = 50
+    n_components: int = Field(default=10, gt=0)
+    n_clusters: int = Field(default=50, gt=0)
+    incremental_n_components: int | None = Field(default=None, gt=0)
+    incremental_epochs: int = Field(default=3, gt=0)
+    incremental_init_sample_size: int = Field(default=4096, gt=0)
+    cluster_random_seed: int = Field(default=42, ge=0)
+    # 固定 PCA 后的欧氏距离；0 关闭。需按业务标注校准，不是概率。
+    incremental_max_distance: float = Field(default=0.0, ge=0)
+    incremental_min_margin: float = Field(default=0.0, ge=0, le=1)
+    incremental_cache_dir: str | None = None  # 默认系统临时目录，每次运行独立并自动清理
     min_cluster_size: int = 100
     use_gpu: bool = False
 
@@ -81,11 +90,15 @@ class Settings(BaseSettings):
 
     # 流式/分片与性能
     shard_size: int = 2048          # 每个 parquet 分片的会话数（也是 embedding 累积窗口）
-    cluster_batch_size: int = 2048  # 聚类分批读取大小
+    cluster_batch_size: int = Field(default=2048, gt=0)  # 聚类分批读取大小
     jieba_workers: int = 4          # jieba 预分词多进程数（CPU 大户，§5 步骤7）
     embed_cache_max_len: int = 24   # 只把短文本（高频话术）放 Redis 缓存（§9 小热数据）
-    repr_pool_size: int = 40        # 每主题代表文档蓄水池上限（送 LLM 前 MMR 选样）
-    topic_merge_sim: float = 0.85   # 主题质心余弦≥此值则合并近重复簇；0 关闭
+    repr_pool_size: int = Field(default=40, gt=0)  # 每主题代表文档蓄水池上限
+    topic_merge_sim: float = Field(default=0.85, ge=0, le=1)  # 0 关闭；阈值需随 linkage 校准
+    topic_merge_linkage: Literal["single", "average", "complete"] = "single"
+    # 可独立覆盖 UMAP 的合并配置；None 兼容原有 TOPIC_MERGE_* 设置。
+    umap_topic_merge_linkage: Literal["single", "average", "complete"] | None = None
+    umap_topic_merge_sim: float | None = Field(default=None, ge=0, le=1)
 
     # 趋势/突增（环比昨日）
     trend_match_sim: float = 0.3    # 与昨日主题的热词 Jaccard≥此值视为同一主题

@@ -81,7 +81,7 @@ def build_vectorizer(online: bool = False):
     """返回供 BERTopic 用的 vectorizer。
 
     文档已是空格分隔的词串（tokenize_batch 预分词），故只需空格切分。
-    online=True 走 OnlineCountVectorizer（incremental partial_fit 路径）。
+    online=True 保留 OnlineCountVectorizer 兼容入口；当前 incremental 直接统计最终标签词频。
     """
     common = dict(tokenizer=str.split, token_pattern=None, min_df=1)
     if online:
