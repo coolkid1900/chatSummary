@@ -1,4 +1,4 @@
-.PHONY: build up down logs seed pipeline pipeline-umap api-logs psql redis-cli clean
+.PHONY: build up down logs seed pipeline pipeline-umap api-logs contact-logs psql redis-cli clean
 
 RUN_DATE ?= 2026-06-27
 CUSTOMERS ?= 300
@@ -6,8 +6,8 @@ CUSTOMERS ?= 300
 build:            ## 构建镜像
 	docker compose build
 
-up:               ## 起 MySQL + Redis + API（OrbStack）
-	docker compose up -d mysql redis api
+up:               ## 起 MySQL + Redis + API + 接触总结 worker（OrbStack）
+	docker compose up -d mysql redis api contact-worker
 
 down:             ## 停止并移除容器
 	docker compose down
@@ -27,6 +27,9 @@ pipeline-umap:    ## 用 umap_hdbscan 后端跑（验证两套后端，§6.0）
 
 api-logs:         ## 看 API 日志
 	docker compose logs -f api
+
+contact-logs:     ## 看接触总结 worker 日志
+	docker compose logs -f contact-worker
 
 psql:             ## 进 MySQL 命令行
 	docker compose exec mysql mysql -uchat -pchatpass chat_summary

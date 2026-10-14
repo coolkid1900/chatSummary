@@ -105,6 +105,30 @@ class Settings(BaseSettings):
     surge_pct: float = 0.5          # 环比涨幅≥此值（+50%）判为突增
     surge_min_heat: int = 20        # 突增的最小热度门槛，过滤长尾噪声
 
+    # 经理×客户接触总结（两层：日笔记 → 月度总结）
+    # 大模型限流按滑动窗口计数，与厂商口径一致：N 次/窗口 + 输入 token/分钟。
+    contact_llm_max_requests: int = Field(default=5, gt=0)
+    contact_llm_request_window_sec: float = Field(default=10.5, gt=0)  # 含 0.5s 余量
+    contact_llm_tokens_per_min: int = Field(default=30000, gt=0)
+    contact_llm_token_safety: float = Field(default=0.9, gt=0, le=1)  # 估算误差余量
+    contact_llm_concurrency: int = Field(default=6, gt=0)
+    contact_llm_timeout: float = Field(default=60, gt=0)
+    # 关闭 DeepSeek 推理模式（推理 token 计入 max_tokens，会截断 JSON 输出）；其他厂商不支持时设为 false
+    contact_llm_disable_thinking: bool = True
+    # 发送前的输入 token 估算系数，需按 llm_calls 中实际 prompt_tokens 校准。
+    contact_tokens_per_cjk: float = Field(default=0.7, gt=0)
+    contact_tokens_per_other: float = Field(default=0.35, gt=0)
+    contact_max_call_tokens: int = Field(default=8000, gt=0)   # 单次调用输入上限
+    contact_note_batch_tokens: int = Field(default=6000, gt=0)  # 冷启动多天打包上限
+    contact_line_max_chars: int = Field(default=300, gt=0)      # 单行发言截断
+    contact_summary_notes_tokens: int = Field(default=2500, gt=0)  # Prompt B 笔记预算
+    contact_window_days: int = Field(default=30, gt=0)
+    contact_read_partitions: int = Field(default=8, gt=0)  # 全量读取按经理哈希分批，限制内存
+    contact_worker_poll_seconds: float = Field(default=2, gt=0)
+    contact_job_lease_seconds: int = Field(default=600, gt=0)  # 心跳超时后任务可被其他 worker 接管
+    contact_nightly_enabled: bool = False  # worker 每天自动提交前一天的日笔记批次
+    contact_nightly_hour: int = Field(default=1, ge=0, le=23)
+
     worker_id: str = "local"
 
     # HTTP 触发批处理的鉴权 token（为空则不校验，仅建议本地/内网用）

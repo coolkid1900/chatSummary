@@ -44,6 +44,21 @@ services:
       redis:
         condition: service_healthy
 
+  # 接触总结 worker：消费日笔记批次与按需总结任务（可多副本，租约过期自动接管）
+  contact-worker:
+    image: chatsummary:latest
+    env_file: .env
+    command: python -m app.contacts.worker
+    restart: unless-stopped
+    stop_grace_period: 60s   # 收到 SIGTERM 后等进行中的模型调用结束，再把任务放回队列
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   # 造数据（一次性）：docker compose run --rm seed
   seed:
     image: chatsummary:latest
