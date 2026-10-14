@@ -5,3 +5,4 @@ __pycache__/
 .claude/
 data/embeddings/
 *.egg-info/
+data/db_backups/

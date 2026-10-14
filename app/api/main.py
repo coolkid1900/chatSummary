@@ -10,22 +10,37 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import date as date_cls, datetime, timedelta
+from contextlib import asynccontextmanager
+from datetime import date as date_cls, timedelta
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from app.config import get_settings
-from app.db import get_session
+from app.db import get_engine, get_session
 from app import lexicon
-from app.models import DailyHotTopic, PipelineRun
+from app.api.common import check_auth as _check_auth, validate_date as _validate_date
+from app.api.contacts import router as contacts_router
+from app.models import Base, DailyHotTopic, PipelineRun
 from app.pipeline.run_pipeline import run as run_pipeline
 from app.redis_client import get_redis
 from app.api.seed_data import seed_data
 
-app = FastAPI(title="客户经理聊天热点总结", version="0.1.0")
 log = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    # 建表兜底（幂等）：API 可能先于 worker 启动。失败不阻止启动，查询时再报错。
+    try:
+        await asyncio.to_thread(Base.metadata.create_all, get_engine())
+    except Exception:
+        log.exception("启动时建表失败")
+    yield
+
+
+app = FastAPI(title="客户经理聊天热点总结", version="0.1.0", lifespan=lifespan)
+app.include_router(contacts_router)
 
 # 保留强引用，确保 create_task 创建的任务在完成前不会被回收。
 _pipeline_tasks: set[asyncio.Task[None]] = set()
@@ -116,20 +131,6 @@ def _acquire_run_lock(date_str: str, run_id: str, force: bool = False) -> bool:
     if force:
         return redis.set(key, run_id, ex=_RUN_LOCK_TTL) is not None
     return redis.set(key, run_id, nx=True, ex=_RUN_LOCK_TTL) is not None
-
-
-def _check_auth(token: str | None) -> None:
-    expected = get_settings().trigger_token
-    if expected and token != expected:
-        raise HTTPException(status_code=401, detail="无效的触发 token")
-
-
-def _validate_date(d: str) -> str:
-    try:
-        datetime.strptime(d, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"日期格式应为 YYYY-MM-DD: {d}")
-    return d
 
 
 def _run_to_dict(r: PipelineRun) -> dict:

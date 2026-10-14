@@ -7,3 +7,4 @@ data/cluster-cache
 reports
 .env
 *.md
+data/db_backups
