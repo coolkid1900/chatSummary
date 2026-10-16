@@ -50,7 +50,7 @@ services:
     env_file: .env
     command: python -m app.contacts.worker
     restart: unless-stopped
-    stop_grace_period: 60s   # 收到 SIGTERM 后等进行中的模型调用结束，再把任务放回队列
+    stop_grace_period: 90s   # 大于单次调用超时（60s）：等进行中的调用结束，再把任务放回队列
     volumes:
       - ./data:/app/data
     depends_on:

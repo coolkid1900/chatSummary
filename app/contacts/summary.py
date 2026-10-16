@@ -5,7 +5,7 @@
 - 信号时间线：已核实、且所属笔记成功的信号事件，按日期汇总最终状态；
 - 待跟进 / 每日笔记：status=ok 的日笔记。
 input_fp 不变且已有成功结果时直接复用；窗口内所有天都已分析且没有业务内容时套模板，不调用模型；没有可用笔记又有未分析的天时不生成。
-模型输出经代码校验（沟通次数、字数、数字来源、PII），失败重试一次，仍失败标记为 review。
+模型输出经代码校验（沟通次数、字数、数字来源、PII、内部用语），失败时带上原因重试一次，仍失败标记为 review。
 """
 from __future__ import annotations
 
@@ -21,15 +21,21 @@ from sqlalchemy.dialects.mysql import insert
 from app.config import get_settings
 from app.contacts.dbutil import run_in_transaction
 from app.contacts.llm import ContactLlm, LlmCallError
-from app.contacts.prompts import (SUMMARY_PROMPT_VERSION, build_summary_system, build_summary_user,
-                                  signal_name, window_label)
+from app.contacts.prompts import (NEED_CONFIRM_DAYS, SIGNALS, SUMMARY_PROMPT_VERSION,
+                                  build_summary_system, build_summary_user, window_label)
 from app.contacts.stats import aggregate_window
 from app.contacts.transcript import estimate_tokens, normalize, period_label
 from app.db import get_session
 from app.models import ContactDailyNote, ContactDailyStat, ContactSignalEvent, ContactSummary
 from app.pipeline.pii import mask_pii
 
-_MAX_SUMMARY_CHARS = 320
+def length_range(business_days: int) -> tuple[int, int, int]:
+    """(最少字数, 校验上限, 提示模型压缩到的目标上限)；上限在 prompt 目标上留约 20% 余量。"""
+    if business_days <= 1:
+        return 50, 180, 150
+    if business_days <= 3:
+        return 80, 260, 220
+    return 100, 360, 300
 
 
 def window_bounds(window_end: date, days: int) -> tuple[date, date]:
@@ -39,17 +45,24 @@ def window_bounds(window_end: date, days: int) -> tuple[date, date]:
 # ===== 输入拼装（纯函数）=====
 
 def build_signal_timeline(events) -> list[dict]:
-    """events: 按 (日期, id) 排序的对象，含 event_date / signal_code / status / evidence。"""
+    """events: 按 (日期, id) 排序的对象，含 event_date / signal_code / status / evidence。
+
+    不在当前代码表中的旧代码直接忽略；深层需求在窗口内出现满 NEED_CONFIRM_DAYS 天才算已确认。
+    """
     by_code: dict[str, list] = {}
     for e in events:
-        by_code.setdefault(e.signal_code, []).append(e)
+        if e.signal_code in SIGNALS:
+            by_code.setdefault(e.signal_code, []).append(e)
     timeline = []
     for code, items in by_code.items():
+        d = SIGNALS[code]
         open_dates = sorted({e.event_date for e in items if e.status == "open"})
         last = items[-1]
-        entry = {"code": code, "name": signal_name(code), "status": last.status,
-                 "first_date": items[0].event_date.isoformat(),
+        entry = {"code": code, "name": d.name, "category": d.category, "group": d.group,
+                 "status": last.status, "first_date": items[0].event_date.isoformat(),
                  "last_date": last.event_date.isoformat(), "open_days": len(open_dates)}
+        if d.category == "need":
+            entry["confirmed"] = len(open_dates) >= NEED_CONFIRM_DAYS
         if last.status == "closed":
             entry.update(closed_date=last.event_date.isoformat(), evidence=last.evidence)
             if open_dates:
@@ -57,23 +70,35 @@ def build_signal_timeline(events) -> list[dict]:
         else:
             entry["latest_evidence"] = last.evidence
         timeline.append(entry)
-    # 持续中的信号在前，其次按首次出现时间
-    timeline.sort(key=lambda x: (x["status"] != "open", x["first_date"]))
+    order = {code: i for i, code in enumerate(SIGNALS)}
+    timeline.sort(key=lambda x: order[x["code"]])
     return timeline
+
+
+_SECTION_TITLES = (("topic", "关注话题"), ("need", "深层需求"), ("service", "经营信号"))
 
 
 def signal_lines(timeline: list[dict]) -> list[str]:
     lines = []
-    for s in timeline:
-        period = lambda key: period_label(date.fromisoformat(s[key]))
-        if s["status"] == "open":
-            lines.append(f"- {s['name']}：持续中；{period('first_date')}起出现，"
-                         f"共{s['open_days']}天，最近{period('last_date')}")
-        elif s.get("first_open_date"):
-            lines.append(f"- {s['name']}：已关闭；{period('first_open_date')}出现 → "
-                         f"{period('closed_date')}关闭，依据：“{s['evidence']}”")
-        else:
-            lines.append(f"- {s['name']}：已关闭；{period('closed_date')}关闭，依据：“{s['evidence']}”")
+    for category, title in _SECTION_TITLES:
+        items = [s for s in timeline if s["category"] == category]
+        if not items:
+            continue
+        lines.append(f"{title}：")
+        for s in items:
+            period = lambda key: period_label(date.fromisoformat(s[key]))
+            label = f"{s['name']}（{s['group']}）" if category == "topic" else s["name"]
+            if s["status"] == "closed":
+                since = f"{period('first_open_date')}出现 → " if s.get("first_open_date") else ""
+                lines.append(f"- {label}：已关闭；{since}{period('closed_date')}关闭，依据：“{s['evidence']}”")
+                continue
+            span = f"{period('first_date')}起，共{s['open_days']}天，最近{period('last_date')}"
+            if category == "need":
+                state = f"多次出现（{s['open_days']}天）" if s["confirmed"] else f"仅出现{s['open_days']}天"
+                lines.append(f"- {label}：{state}；{period('first_date')}起，最近{period('last_date')}；"
+                             f"依据：“{s['latest_evidence']}”")
+            else:
+                lines.append(f"- {label}：{span}；依据：“{s['latest_evidence']}”")
     return lines
 
 
@@ -161,26 +186,32 @@ def template_summary(inp: SummaryInput, window_days: int) -> str:
 
 
 _NUMBER = re.compile(r"\d+(?:\.\d+)?\s*(?:%|％|万|元|亿)")
-_FORBIDDEN = ("系统", "笔记", "持续中", "仍在持续")  # 内部用语不得出现在给经理看的正文里
+# 内部用语与判断过程不得出现在给经理看的正文里
+_FORBIDDEN = ("系统", "笔记", "标签", "持续中", "仍在持续", "已确认", "证据", "客户特点", "业务内容")
+_CODE = re.compile(r"(?<![A-Za-z0-9])[A-Z]+_[A-Z_]+(?![A-Za-z0-9])")  # 标签代码
 
 
-def validate_summary(data: dict, inp: SummaryInput) -> tuple[str, list[str], list[str]]:
+def validate_summary(data: dict, inp: SummaryInput,
+                     strict_length: bool = True) -> tuple[str, list[str], list[str]]:
+    """strict_length=False 用于重试：篇幅是软约束，略长（不超过上限的 1.5 倍）也接受，不因几个字置空总结。"""
     summary = " ".join(str(data.get("summary") or "").split())
     if not summary:
         raise ValueError("summary 为空")
     n = inp.stats["session_count"]
     if f"沟通{n}次" not in summary:
         raise ValueError(f"沟通次数与统计（{n}次）不一致")
-    min_chars = 50 if inp.business_days <= 2 else 100
-    if not min_chars <= len(summary) <= _MAX_SUMMARY_CHARS:
-        raise ValueError(f"字数 {len(summary)} 不在 {min_chars}～{_MAX_SUMMARY_CHARS} 范围")
+    min_chars, max_chars, target = length_range(inp.business_days)
+    if len(summary) > (max_chars if strict_length else int(max_chars * 1.5)):
+        raise ValueError(f"字数 {len(summary)} 超过上限，请压缩到 {target} 字以内")
+    if len(summary) < min_chars:
+        raise ValueError(f"字数 {len(summary)} 少于 {min_chars} 字")
     source = normalize(inp.user_prompt)
     unknown = [m for m in _NUMBER.findall(summary) if normalize(m) not in source]
     if unknown:
         raise ValueError(f"出现输入中没有的数字：{'、'.join(unknown)}")
     if mask_pii(summary) != summary:
         raise ValueError("包含疑似个人敏感信息")
-    leaked = [w for w in _FORBIDDEN if w in summary]
+    leaked = [w for w in _FORBIDDEN if w in summary] + _CODE.findall(summary)
     if leaked:
         raise ValueError(f"出现内部用语：{'、'.join(leaked)}")
     lists = []
@@ -266,10 +297,10 @@ def summarize_pair(manager_id: str, customer_id: str, window_end: date, *, job_i
         kind = "template"
     else:
         llm = llm or ContactLlm()
-        kind, error = "review", None
-        for _ in range(2):
+        kind, error, user = "review", None, inp.user_prompt
+        for attempt in range(2):
             try:
-                res = llm.chat_json(purpose="summary", system=inp.system_prompt, user=inp.user_prompt,
+                res = llm.chat_json(purpose="summary", system=inp.system_prompt, user=user,
                                     prompt_version=SUMMARY_PROMPT_VERSION, max_tokens=800,
                                     priority=priority, manager_id=manager_id, customer_id=customer_id)
             except LlmCallError:
@@ -278,9 +309,11 @@ def summarize_pair(manager_id: str, customer_id: str, window_end: date, *, job_i
             tokens += res.prompt_tokens
             values["llm_call_id"] = res.call_id
             try:
-                summary, topics, suggestions = validate_summary(res.data, inp)
+                summary, topics, suggestions = validate_summary(res.data, inp, strict_length=attempt == 0)
             except ValueError as exc:
                 error = f"校验失败：{exc}"
+                # 重试时告诉模型哪里不合格，否则同样的输入大概率得到同样的输出。
+                user = f"{inp.user_prompt}\n\n【修改要求】上一次输出未通过检查：{exc}。请按写作要求修正后重新输出。"
                 continue
             values.update(status="success", summary=summary, main_topics=topics, suggestions=suggestions)
             kind = "success"

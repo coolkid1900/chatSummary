@@ -67,6 +67,14 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
 
+_EVIDENCE_IGNORED = re.compile(r"[\s\[\]【】（）()“”\"'‘’「」《》<>，。、；：！？,.;:!?…·~～-]")
+
+
+def evidence_key(text: str) -> str:
+    """证据比对用：忽略空白、标点和括号（如脱敏占位“[他行]”被摘成“他行”），文字仍须逐字一致。"""
+    return _EVIDENCE_IGNORED.sub("", text)
+
+
 def period_label(d: date) -> str:
     part = "上旬" if d.day <= 10 else "中旬" if d.day <= 20 else "下旬"
     return f"{d.month}月{part}"

@@ -28,13 +28,14 @@ from app.contacts.prompts import NOTE_PROMPT_VERSION, NOTE_SYSTEM, SIGNALS, buil
 from app.contacts.reader import ChatMsg, PairDayKey, read_day_partition, read_manager_range
 from app.contacts.stats import DayStats, compute_day_stats
 from app.contacts.dbutil import run_in_transaction
-from app.contacts.transcript import DayTranscript, clean_day, estimate_tokens, load_chitchat, normalize
+from app.contacts.transcript import DayTranscript, clean_day, estimate_tokens, evidence_key, load_chitchat
 from app.db import get_session
 from app.models import ContactDailyNote, ContactDailyStat, ContactSignalEvent
 
 log = logging.getLogger(__name__)
 
 _LIST_LIMITS = {"topics": 3, "customer_points": 3, "manager_actions": 2, "facts": 3, "pending": 3}
+_MAX_SIGNALS_PER_DAY = 12
 _ITEM_MAX_CHARS = 80
 _EVIDENCE_MAX_CHARS = 60
 _SIGNAL_LOOKBACK_DAYS = 90
@@ -88,7 +89,7 @@ def parse_note_output(data: dict, transcripts: dict[date, DayTranscript]) -> dic
             continue
         if d not in transcripts or d in result:
             continue
-        source = normalize("\n".join(transcripts[d].lines))
+        source = evidence_key("\n".join(transcripts[d].lines))
         signals = []
         for s in item.get("signals") or []:
             if not isinstance(s, dict):
@@ -97,8 +98,10 @@ def parse_note_output(data: dict, transcripts: dict[date, DayTranscript]) -> dic
             status = str(s.get("status", "")).strip().lower()
             if code not in SIGNALS or status not in ("open", "closed"):
                 continue
+            if any(x.code == code for x in signals) or len(signals) >= _MAX_SIGNALS_PER_DAY:
+                continue  # 同一天同一 code 只保留第一条
             evidence = str(s.get("evidence") or "").strip().strip("“”\"'「」 ")[:_EVIDENCE_MAX_CHARS]
-            key = normalize(evidence)
+            key = evidence_key(evidence)
             signals.append(ParsedSignal(code, status, evidence, bool(key) and key in source))
         result[d] = ParsedDay(**{k: _str_list(item.get(k), n) for k, n in _LIST_LIMITS.items()},
                               signals=signals)
@@ -109,6 +112,8 @@ def open_signals_from_events(events) -> list[tuple[str, date]]:
     """events 按 (日期, id) 排序：(code, status, event_date)。返回仍未关闭的 (code, 本轮开启日期)。"""
     since: dict[str, date] = {}
     for code, status, day in events:
+        if code not in SIGNALS:  # 代码表调整后的旧代码不再提示给模型
+            continue
         if status == "open":
             since.setdefault(code, day)
         else:
@@ -241,7 +246,7 @@ class NoteProcessor:
         try:
             res = self.llm.chat_json(
                 purpose="note", system=NOTE_SYSTEM, user=user, prompt_version=NOTE_PROMPT_VERSION,
-                max_tokens=min(4000, 500 + 400 * len(items)), priority=self.priority,
+                max_tokens=min(6000, 700 + 500 * len(items)), priority=self.priority,
                 manager_id=manager, customer_id=customer)
         except InterruptedError:
             return

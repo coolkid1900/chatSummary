@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta
 from sqlalchemy import and_, or_, select, text, update
 
 from app.config import get_settings
+from app.contacts.prompts import NOTE_PROMPT_VERSION
 from app.db import get_engine, get_session
 from app.models import ContactDailyNote, ContactNoteRun, ContactSummaryJob
 
@@ -210,7 +211,10 @@ class Lease:
 # ===== 覆盖情况 =====
 
 def missing_note_dates(manager_id: str, dates: list[date]) -> list[date]:
-    """窗口内需要补数的日期：没有成功批次覆盖，或该经理有失败笔记。"""
+    """窗口内需要补数的日期：没有成功批次覆盖，或该经理有失败笔记、旧 prompt 版本的笔记。
+
+    prompt 或标签代码表升级后，旧版本笔记会在下次提交总结时自动重算，避免新旧标签混在一份总结里。
+    """
     if not dates:
         return []
     session = get_session()
@@ -219,11 +223,12 @@ def missing_note_dates(manager_id: str, dates: list[date]) -> list[date]:
             ContactNoteRun.stat_date.in_(dates),
             ContactNoteRun.manager_id.in_(["", manager_id]),
             ContactNoteRun.status.in_(DONE_OK))).scalars())
-        failed = set(session.execute(select(ContactDailyNote.note_date).where(
+        stale = set(session.execute(select(ContactDailyNote.note_date).where(
             ContactDailyNote.manager_id == manager_id,
             ContactDailyNote.note_date.between(min(dates), max(dates)),
-            ContactDailyNote.status == "failed")).scalars())
-        return sorted((set(dates) - covered) | failed)
+            or_(ContactDailyNote.status == "failed",
+                ContactDailyNote.prompt_version != NOTE_PROMPT_VERSION))).scalars())
+        return sorted((set(dates) - covered) | stale)
     finally:
         session.close()
 

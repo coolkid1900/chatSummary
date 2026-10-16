@@ -11,12 +11,12 @@ import re
 import threading
 import unittest
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select, text, update
 
 from app.contacts import jobs
 from app.contacts.limiter import SlidingWindowLimiter
@@ -54,9 +54,9 @@ CHATS = [
     ("2026-07-10 10:00", True, C1, "窗口之外的消息不应计入"),
 ]
 
-RULES = [("回撤", "RISK_AVERSE", "open"), ("压在心上", "ESTATE", "open"),
-         ("差得有点多", "YIELD_SEEKING", "open"), ("不纠结", "YIELD_SEEKING", "closed"),
-         ("办妥", "ESTATE", "closed")]
+RULES = [("回撤", "NEED_RISK_AVERSE", "open"), ("压在心上", "NEED_LEGACY_ANXIETY", "open"),
+         ("差得有点多", "NEED_YIELD", "open"), ("不纠结", "NEED_YIELD", "closed"),
+         ("办妥", "NEED_LEGACY_ANXIETY", "closed")]
 
 
 def fake_note(user: str) -> dict:
@@ -70,7 +70,7 @@ def fake_note(user: str) -> dict:
         signals = [{"code": code, "status": status, "evidence": p[:30]}
                    for p in pieces for kw, code, status in RULES if kw in p]
         if any("大额存单" in p for p in pieces):
-            signals.append({"code": "PRODUCT_INTENT", "status": "open", "evidence": "客户非常想买大额存单"})
+            signals.append({"code": "SVC_PURCHASE_INTENT", "status": "open", "evidence": "客户非常想买大额存单"})
         days.append({"date": day, "topics": ["业务咨询"], "customer_points": pieces[:3],
                      "manager_actions": manager[:2],
                      "facts": ["客户完成传承安排"] if any("办妥" in p for p in pieces) else [],
@@ -155,8 +155,17 @@ class ContactSummaryIntegrationTests(unittest.TestCase):
 
     def run_job(self, client: FakeClient, **kwargs) -> ContactSummaryJob:
         job, _ = jobs.enqueue_summary_job(MANAGER, END, kwargs.get("customer_ids"), kwargs.get("force", False))
-        lease, row = jobs.claim_summary_job()
-        self.assertEqual(row.job_id, job.job_id, "测试库中存在其他排队任务")
+        # 只领取本测试创建的任务：库里可能有真实任务在排队或租约过期，不能用 claim_summary_job 抢。
+        token = uuid.uuid4().hex
+        session = get_session()
+        try:
+            session.execute(update(ContactSummaryJob).where(ContactSummaryJob.job_id == job.job_id).values(
+                status="running", attempt_token=token, heartbeat_at=datetime.utcnow(), started_at=datetime.utcnow()))
+            session.commit()
+            row = session.get(ContactSummaryJob, job.job_id)
+        finally:
+            session.close()
+        lease = jobs.Lease(ContactSummaryJob, "job_id", job.job_id, token)
         limiter = SlidingWindowLimiter(f"zzit_{uuid.uuid4().hex[:6]}", max_requests=100,
                                        request_window=1, max_tokens=100_000)
         self.addCleanup(lambda: limiter.redis.delete(*limiter.keys))
@@ -200,9 +209,9 @@ class ContactSummaryIntegrationTests(unittest.TestCase):
         self.assertEqual(notes[(C1, "2026-08-02")].pending, ["整理持仓收益与回撤"])
 
         events = self.query(ContactSignalEvent)
-        estate = [(e.event_date.isoformat(), e.status) for e in events if e.signal_code == "ESTATE"]
+        estate = [(e.event_date.isoformat(), e.status) for e in events if e.signal_code == "NEED_LEGACY_ANXIETY"]
         self.assertEqual(sorted(estate), [("2026-07-24", "open"), ("2026-08-14", "closed")])
-        fake = [e for e in events if e.signal_code == "PRODUCT_INTENT"]
+        fake = [e for e in events if e.signal_code == "SVC_PURCHASE_INTENT"]
         self.assertEqual([e.evidence_verified for e in fake], [False])
 
         summaries = {s.customer_id: s for s in self.query(ContactSummary)}
@@ -212,7 +221,7 @@ class ContactSummaryIntegrationTests(unittest.TestCase):
         self.assertEqual(c1.stats_json["session_count"], 8)
         self.assertEqual(c1.stats_json["business_days"], 7)
         status = {s["code"]: s["status"] for s in c1.signals_json}
-        self.assertEqual(status, {"RISK_AVERSE": "open", "ESTATE": "closed", "YIELD_SEEKING": "closed"})
+        self.assertEqual(status, {"NEED_RISK_AVERSE": "open", "NEED_LEGACY_ANXIETY": "closed", "NEED_YIELD": "closed"})
         self.assertEqual(summaries[C2].stats_json["session_count"], 2)
         self.assertEqual(summaries[C2].signals_json, [])  # 未核实的证据不进时间线
 
@@ -224,6 +233,18 @@ class ContactSummaryIntegrationTests(unittest.TestCase):
         again = self.run_job(client)
         self.assertEqual((again.status, again.reused_count), ("success", 2))
         self.assertEqual(len(client.calls), 4)
+
+        # prompt / 标签代码表升级后，旧版本笔记的日期需要重算
+        session = get_session()
+        try:
+            session.execute(update(ContactDailyNote).where(
+                ContactDailyNote.manager_id == MANAGER, ContactDailyNote.note_date == date(2026, 8, 6))
+                .values(prompt_version="note-v0"))
+            session.commit()
+        finally:
+            session.close()
+        window = [date(2026, 7, 21) + timedelta(days=i) for i in range(30)]
+        self.assertEqual(jobs.missing_note_dates(MANAGER, window), [date(2026, 8, 6)])
 
         self.check_api(job.job_id)
 
@@ -237,15 +258,15 @@ class ContactSummaryIntegrationTests(unittest.TestCase):
         r = api.post("/contacts/summary/list", json={"manager_id": MANAGER, "end_date": END.isoformat(),
                                                       "sort": "signal_change"}).json()
         self.assertEqual([i["customer_id"] for i in r["items"]], [C1, C2])
-        self.assertEqual({s["code"] for s in r["items"][0]["closed_signals"]}, {"ESTATE", "YIELD_SEEKING"})
+        self.assertEqual({s["code"] for s in r["items"][0]["closed_signals"]}, {"NEED_LEGACY_ANXIETY", "NEED_YIELD"})
 
         r = api.post("/contacts/summary/list", json={"manager_id": MANAGER, "end_date": END.isoformat(),
-                                                      "signal": "RISK_AVERSE", "signal_status": "open"}).json()
+                                                      "signal": "NEED_RISK_AVERSE", "signal_status": "open"}).json()
         self.assertEqual(r["total"], 1)
 
         r = api.post("/contacts/summary/detail", json={"manager_id": MANAGER, "customer_id": C1,
                                                         "end_date": END.isoformat()}).json()
-        closed = next(s for s in r["signals"] if s["code"] == "ESTATE")
+        closed = next(s for s in r["signals"] if s["code"] == "NEED_LEGACY_ANXIETY")
         self.assertEqual((closed["closed_date"], closed["evidence"]),
                          ("2026-08-14", "传承那块上周已经跟律师办妥了，不用再操心了"))
 
@@ -255,7 +276,7 @@ class ContactSummaryIntegrationTests(unittest.TestCase):
         self.assertEqual(r["items"][0]["signals"][0]["verified"], False)
         self.assertEqual(r["missing_dates"], [])
 
-        r = api.post("/contacts/signal/list", json={"manager_id": MANAGER, "code": "ESTATE",
+        r = api.post("/contacts/signal/list", json={"manager_id": MANAGER, "code": "NEED_LEGACY_ANXIETY",
                                                      "end_date": END.isoformat()}).json()
         self.assertEqual([(i["customer_id"], i["status"]) for i in r["items"]], [(C1, "closed")])
 
