@@ -101,6 +101,8 @@ class ContactLlm:
                       prompt_version=prompt_version, model=self.settings.llm_model)
         error = None
         for attempt in range(1, _MAX_ATTEMPTS + 1):
+            if self.stop is not None and self.stop.is_set():
+                raise InterruptedError("worker 停止，不再发起调用")
             # 每次尝试单独登记限流配额，重试也计入窗口。
             slot = self.limiter.acquire(est, priority, call_id=f"{call_id}:{attempt}", stop=self.stop)
             if self.fatal_error:  # 排队期间其他线程已遇到鉴权/余额错误
@@ -132,12 +134,12 @@ class ContactLlm:
                     log.error("LLM 鉴权/余额错误，本批次后续调用直接失败：%s", error)
                 if exc.status_code < 500:
                     break
-                time.sleep(2 ** attempt)
+                self._backoff(attempt)
                 continue
             except (APITimeoutError, APIConnectionError) as exc:
                 record["status"] = "failed"
                 error = f"{type(exc).__name__}: {exc}"[:500]
-                time.sleep(2 ** attempt)
+                self._backoff(attempt)
                 continue
 
             usage = resp.usage
@@ -166,12 +168,17 @@ class ContactLlm:
         self._save(record, status=record.get("status") or "failed", attempts=attempt, error=error)
         raise LlmCallError(error or "LLM 调用失败")
 
+    def _backoff(self, attempt: int) -> None:
+        """重试前的退避等待；worker 停止时立即返回，下一轮循环开头会中断。"""
+        if self.stop is not None:
+            self.stop.wait(2 ** attempt)
+        else:
+            time.sleep(2 ** attempt)
+
     def _extra_body(self) -> dict:
-        # DeepSeek 新模型默认先推理，推理 token 计入 max_tokens 且增加耗时与费用；
-        # 结构化抽取不需要推理，默认关闭。其他厂商不支持该参数时设置 CONTACT_LLM_DISABLE_THINKING=false。
-        if self.settings.contact_llm_disable_thinking:
-            return {"extra_body": {"thinking": {"type": "disabled"}}}
-        return {}
+        # 控制推理的参数各厂商不同（见 CONTACT_LLM_EXTRA_BODY）；推理 token 计入 max_tokens 且拖慢响应。
+        extra = self.settings.contact_llm_extra_body
+        return {"extra_body": extra} if extra else {}
 
     @staticmethod
     def _save(record: dict, *, status: str, attempts: int, error: str | None) -> None:

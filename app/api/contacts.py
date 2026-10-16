@@ -147,11 +147,15 @@ class SummaryListReq(BaseModel):
 def _signal_brief(row: ContactSummary) -> tuple[list[dict], list[dict]]:
     opened, closed = [], []
     for s in row.signals_json or []:
+        if s["code"] not in SIGNALS:
+            continue  # 代码表调整前生成的旧结果
+        brief = {"code": s["code"], "name": s["name"], "category": SIGNALS[s["code"]].category}
         if s["status"] == "open":
-            opened.append({"code": s["code"], "name": s["name"]})
+            if "confirmed" in s:
+                brief["confirmed"] = s["confirmed"]
+            opened.append(brief)
         else:
-            closed.append({"code": s["code"], "name": s["name"],
-                           "closed_period": period_label(date.fromisoformat(s["closed_date"]))})
+            closed.append({**brief, "closed_period": period_label(date.fromisoformat(s["closed_date"]))})
     return opened, closed
 
 

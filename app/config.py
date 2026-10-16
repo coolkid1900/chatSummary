@@ -113,8 +113,9 @@ class Settings(BaseSettings):
     contact_llm_token_safety: float = Field(default=0.9, gt=0, le=1)  # 估算误差余量
     contact_llm_concurrency: int = Field(default=6, gt=0)
     contact_llm_timeout: float = Field(default=60, gt=0)
-    # 关闭 DeepSeek 推理模式（推理 token 计入 max_tokens，会截断 JSON 输出）；其他厂商不支持时设为 false
-    contact_llm_disable_thinking: bool = True
+    # 原样附加到请求体的厂商参数（JSON）。推理 token 计入 max_tokens 且拖慢响应，结构化抽取不需要推理：
+    # DeepSeek 用 {"thinking": {"type": "disabled"}}；GLM 不能关闭推理，用 {"reasoning_effort": "low"}；不需要时设为 {}
+    contact_llm_extra_body: dict = Field(default_factory=lambda: {"thinking": {"type": "disabled"}})
     # 发送前的输入 token 估算系数，需按 llm_calls 中实际 prompt_tokens 校准。
     contact_tokens_per_cjk: float = Field(default=0.7, gt=0)
     contact_tokens_per_other: float = Field(default=0.35, gt=0)

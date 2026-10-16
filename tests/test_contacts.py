@@ -118,21 +118,30 @@ class NoteOutputTests(unittest.TestCase):
         self.trs = {d: DayTranscript(d, ["09:12 客：传承那块上周已经跟律师办妥了，不用再操心了",
                                          "09:20 客：有没有回撤小一点的替代方案"])}
 
+    def test_evidence_ignores_punctuation_and_masking_brackets(self):
+        d = date(2026, 8, 23)
+        trs = {d: DayTranscript(d, ["19:02 客：[他行]那款一年期理财年化3.2%，你们这款才2.6%"])}
+        data = {"days": [{"date": "2026-08-23", "signals": [
+            {"code": "SVC_COMPETITOR", "status": "open", "evidence": "他行那款一年期理财年化3.2%"},
+            {"code": "NEED_YIELD", "status": "open", "evidence": "那款年化3.2%"}]}]}
+        day = parse_note_output(data, trs)[d]
+        self.assertEqual([s.verified for s in day.signals], [True, False])
+
     def test_verifies_evidence_and_filters_invalid_items(self):
         data = {"has_business_content": True, "days": [
             {"date": "2026-08-14", "topics": ["传承安排", "基金回撤", "稳健", "多余"],
              "customer_points": ["传承已办妥"], "signals": [
-                 {"code": "ESTATE", "status": "closed", "evidence": "“传承那块上周已经跟律师办妥了”"},
-                 {"code": "RISK_AVERSE", "status": "open", "evidence": "客户很害怕亏钱"},
+                 {"code": "NEED_LEGACY_ANXIETY", "status": "closed", "evidence": "“传承那块上周已经跟律师办妥了”"},
+                 {"code": "NEED_RISK_AVERSE", "status": "open", "evidence": "客户很害怕亏钱"},
                  {"code": "UNKNOWN", "status": "open", "evidence": "x"},
-                 {"code": "ESTATE", "status": "maybe", "evidence": "x"}]},
+                 {"code": "NEED_LEGACY_ANXIETY", "status": "maybe", "evidence": "x"}]},
             {"date": "2026-08-20", "topics": ["不在本批次"]}]}
         parsed = parse_note_output(data, self.trs)
         self.assertEqual(list(parsed), [date(2026, 8, 14)])
         day = parsed[date(2026, 8, 14)]
         self.assertEqual(day.topics, ["传承安排", "基金回撤", "稳健"])
         self.assertEqual([(s.code, s.status, s.verified) for s in day.signals],
-                         [("ESTATE", "closed", True), ("RISK_AVERSE", "open", False)])
+                         [("NEED_LEGACY_ANXIETY", "closed", True), ("NEED_RISK_AVERSE", "open", False)])
         self.assertEqual(day.signals[0].evidence, "传承那块上周已经跟律师办妥了")
 
     def test_missing_days_array_is_invalid(self):
@@ -143,9 +152,17 @@ class NoteOutputTests(unittest.TestCase):
         self.assertEqual(parse_note_output({"has_business_content": False, "days": []}, self.trs), {})
 
     def test_open_signals_track_latest_status(self):
-        rows = [("RISK_AVERSE", "open", date(2026, 7, 22)), ("ESTATE", "open", date(2026, 7, 24)),
-                ("RISK_AVERSE", "open", date(2026, 8, 2)), ("ESTATE", "closed", date(2026, 8, 14))]
-        self.assertEqual(open_signals_from_events(rows), [("RISK_AVERSE", date(2026, 7, 22))])
+        rows = [("NEED_RISK_AVERSE", "open", date(2026, 7, 22)), ("NEED_LEGACY_ANXIETY", "open", date(2026, 7, 24)),
+                ("NEED_RISK_AVERSE", "open", date(2026, 8, 2)), ("NEED_LEGACY_ANXIETY", "closed", date(2026, 8, 14))]
+        self.assertEqual(open_signals_from_events(rows), [("NEED_RISK_AVERSE", date(2026, 7, 22))])
+        self.assertEqual(open_signals_from_events([("RISK_AVERSE", "open", date(2026, 7, 22))]), [])
+
+    def test_same_code_kept_once_per_day(self):
+        data = {"days": [{"date": "2026-08-14", "signals": [
+            {"code": "NEED_LEGACY_ANXIETY", "status": "closed", "evidence": "传承那块上周已经跟律师办妥了"},
+            {"code": "NEED_LEGACY_ANXIETY", "status": "open", "evidence": "不用再操心了"}]}]}
+        day = parse_note_output(data, self.trs)[date(2026, 8, 14)]
+        self.assertEqual([(s.code, s.status) for s in day.signals], [("NEED_LEGACY_ANXIETY", "closed")])
 
     def test_pack_batches_respects_budget(self):
         items = [(date(2026, 7, d), DayTranscript(date(2026, 7, d), ["10:00 客：" + "字" * 100]), "fp")
@@ -175,12 +192,12 @@ class SummaryInputTests(unittest.TestCase):
                  note("2026-08-11", status="no_business", topics=()),
                  note("2026-08-14", facts=["已与律师完成传承安排"]),
                  note("2026-08-18", points=["询问持仓受影响多少"], actions=["告知整体回撤约1.8%"])]
-        events = [event(1, "2026-07-22", "RISK_AVERSE", "open"), event(2, "2026-07-24", "ESTATE", "open"),
-                  event(3, "2026-07-28", "YIELD_SEEKING", "open"),
-                  event(4, "2026-08-02", "RISK_AVERSE", "open"),
-                  event(5, "2026-08-06", "YIELD_SEEKING", "closed", "收益那个事我不纠结了"),
-                  event(6, "2026-08-14", "ESTATE", "closed", "传承那块上周已经跟律师办妥了"),
-                  event(7, "2026-08-14", "RISK_AVERSE", "open"), event(8, "2026-08-18", "RISK_AVERSE", "open")]
+        events = [event(1, "2026-07-22", "NEED_RISK_AVERSE", "open"), event(2, "2026-07-24", "NEED_LEGACY_ANXIETY", "open"),
+                  event(3, "2026-07-28", "NEED_YIELD", "open"),
+                  event(4, "2026-08-02", "NEED_RISK_AVERSE", "open"),
+                  event(5, "2026-08-06", "NEED_YIELD", "closed", "收益那个事我不纠结了"),
+                  event(6, "2026-08-14", "NEED_LEGACY_ANXIETY", "closed", "传承那块上周已经跟律师办妥了"),
+                  event(7, "2026-08-14", "NEED_RISK_AVERSE", "open"), event(8, "2026-08-18", "NEED_RISK_AVERSE", "open")]
         return build_summary_input(date(2026, 7, 21), date(2026, 8, 19), stats, notes, events,
                                    30, 2500, "deepseek-chat")
 
@@ -190,8 +207,8 @@ class SummaryInputTests(unittest.TestCase):
         self.assertEqual((inp.business_days, inp.incomplete_days), (7, 0))
         self.assertIn("沟通10次（客户主动发起9次），涉及9天（其中7天有业务内容），最近一次联系为8月中旬",
                       inp.user_prompt)
-        self.assertIn("- 风险/回撤敏感：持续中；7月下旬起出现，共4天，最近8月中旬", inp.user_prompt)
-        self.assertIn("- 传承安排顾虑：已关闭；7月下旬出现 → 8月中旬关闭，依据：“传承那块上周已经跟律师办妥了”",
+        self.assertIn("深层需求：\n- 风险敏感型：多次出现（4天）；7月下旬起，最近8月中旬；依据：“原话”", inp.user_prompt)
+        self.assertIn("- 传承焦虑型：已关闭；7月下旬出现 → 8月中旬关闭，依据：“传承那块上周已经跟律师办妥了”",
                       inp.user_prompt)
         self.assertIn("- 8月上旬：整理持仓收益与回撤情况", inp.user_prompt)
         self.assertIn("08-18｜话题：基金回撤｜客户：询问持仓受影响多少｜经理：告知整体回撤约1.8%", inp.user_prompt)
@@ -215,8 +232,19 @@ class SummaryInputTests(unittest.TestCase):
         self.assertEqual((inp.business_days, inp.incomplete_days), (1, 2))
 
     def test_timeline_closed_without_open_in_window(self):
-        timeline = build_signal_timeline([event(1, "2026-08-06", "COMPETITOR", "closed", "不比了")])
-        self.assertEqual(signal_lines(timeline), ["- 他行比较：已关闭；8月上旬关闭，依据：“不比了”"])
+        timeline = build_signal_timeline([event(1, "2026-08-06", "SVC_COMPETITOR", "closed", "不比了")])
+        self.assertEqual(signal_lines(timeline), ["经营信号：", "- 他行比较：已关闭；8月上旬关闭，依据：“不比了”"])
+
+    def test_timeline_groups_topics_and_confirms_needs_by_days(self):
+        timeline = build_signal_timeline([
+            event(1, "2026-08-02", "INV_FUND", "open", "基金怎么一直跌"),
+            event(2, "2026-08-03", "NEED_CONTROL", "open", "我自己来看"),
+            event(3, "2026-08-05", "RISK_AVERSE", "open", "旧代码"),   # 代码表调整前的旧代码
+        ])
+        self.assertEqual([t["code"] for t in timeline], ["INV_FUND", "NEED_CONTROL"])
+        self.assertEqual(signal_lines(timeline), [
+            "关注话题：", "- 关注基金（投资理财）：8月上旬起，共1天，最近8月上旬；依据：“基金怎么一直跌”",
+            "深层需求：", "- 控制权偏好：仅出现1天；8月上旬起，最近8月上旬；依据：“我自己来看”"])
 
     def test_note_lines_compress_then_drop_low_priority_days(self):
         notes = [note(f"2026-08-{d:02d}", points=["客户诉求" * 10]) for d in range(1, 11)]
@@ -254,8 +282,13 @@ class ValidateSummaryTests(unittest.TestCase):
             validate_summary({"summary": self.text + "预计年化收益3.5%。"}, self.inp)
 
     def test_length_and_pii(self):
-        with self.assertRaisesRegex(ValueError, "字数"):
+        with self.assertRaisesRegex(ValueError, "少于"):
             validate_summary({"summary": "近1个月与客户沟通10次。"}, self.inp)
+        with self.assertRaisesRegex(ValueError, "压缩到 300 字以内"):
+            validate_summary({"summary": self.text * 4}, self.inp)
+        longer = self.text + "建议后续结合客户对回撤的敏感，在市场波动时主动同步持仓表现。" * 9
+        self.assertGreater(len(longer), 360)
+        validate_summary({"summary": longer}, self.inp, strict_length=False)  # 重试时略长可接受
         with self.assertRaisesRegex(ValueError, "敏感"):
             validate_summary({"summary": self.text + "客户手机13812345678。"}, self.inp)
 
@@ -371,3 +404,65 @@ class SummaryLeakTests(unittest.TestCase):
                 "建议市场波动时主动同步持仓表现。")
         with self.assertRaisesRegex(ValueError, "内部用语"):
             validate_summary({"summary": text + "持仓报告是否发送系统未核实。"}, inp)
+        with self.assertRaisesRegex(ValueError, "NEED_RISK_AVERSE"):
+            validate_summary({"summary": text + "客户属于NEED_RISK_AVERSE。"}, inp)
+        with self.assertRaisesRegex(ValueError, "已确认"):
+            validate_summary({"summary": text + "风险敏感需求已确认。"}, inp)
+
+
+class LlmStopTests(unittest.TestCase):
+    def test_stopped_worker_makes_no_new_calls(self):
+        import threading
+        from app.contacts.llm import ContactLlm
+
+        calls = []
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+            create=lambda **kw: calls.append(kw))))
+        stop = threading.Event()
+        stop.set()
+        llm = ContactLlm(limiter=FakeLimiter(), client=client, stop=stop)
+        with self.assertRaises(InterruptedError):
+            llm.chat_json(purpose="note", system="s", user="u", prompt_version="v", max_tokens=10)
+        self.assertEqual(calls, [])
+
+
+class SummaryRetryFeedbackTests(unittest.TestCase):
+    def test_retry_tells_model_why_output_failed(self):
+        from unittest.mock import patch
+        from app.contacts import summary
+        from app.contacts.llm import LlmResult
+
+        records = ([stat("2026-08-01", sessions=2)], [note("2026-08-01", points=["询问大额存单利率"])], [])
+        good = "近1个月与客户沟通2次，客户曾询问大额存单利率及起存条件，关注存款类产品。建议结合客户资金期限介绍合适的存款产品。"
+        prompts = []
+
+        def chat_json(**kw):
+            prompts.append(kw["user"])
+            text = "近1个月与客户沟通5次。" if len(prompts) == 1 else good
+            return LlmResult(data={"summary": text}, call_id=f"c{len(prompts)}", prompt_tokens=100)
+
+        llm = SimpleNamespace(chat_json=chat_json)
+        session = SimpleNamespace(execute=lambda *a, **k: SimpleNamespace(first=lambda: None), close=lambda: None)
+        with patch.object(summary, "load_pair_records", return_value=records), \
+             patch.object(summary, "get_session", return_value=session), \
+             patch.object(summary, "_save_summary") as save:
+            outcome = summary.summarize_pair("m", "c", date(2026, 8, 19), llm=llm)
+        self.assertEqual(outcome.kind, "success")
+        self.assertNotIn("修改要求", prompts[0])
+        self.assertIn("【修改要求】上一次输出未通过检查：沟通次数与统计（2次）不一致", prompts[1])
+        self.assertEqual(save.call_args.args[3]["summary"], good)
+
+
+class PromptRuleTests(unittest.TestCase):
+    def test_semantic_map_gives_one_tag_per_sentence(self):
+        from app.contacts.prompts import SIGNALS, _SEMANTIC_MAP
+
+        for line in _SEMANTIC_MAP.splitlines():
+            codes = line.split("→")[1].strip().split(" / ")
+            self.assertEqual(len(codes), 1, line)
+            self.assertIn(codes[0], SIGNALS, line)
+
+    def test_note_prompt_has_manager_mention_counter_example(self):
+        from app.contacts.prompts import NOTE_SYSTEM
+
+        self.assertIn("不标 INV_FAMILY_TRUST、INV_INS_TRUST", NOTE_SYSTEM)

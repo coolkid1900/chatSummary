@@ -19,7 +19,7 @@ COPY pyproject.toml ./
 # 只装运行依赖（利用层缓存）
 RUN pip install --no-cache-dir \
         "bertopic>=0.16,<0.17" "scikit-learn>=1.3" "jieba>=0.42" \
-        "pandas>=2.0" "pyarrow>=14.0" "numpy>=1.24,<2.0" "openai>=1.30" \
+        "pandas>=2.0" "pyarrow>=14.0,<26" "numpy>=1.24,<2.0" "openai>=1.30" \
         "SQLAlchemy>=2.0" "PyMySQL>=1.1" "redis>=5.0" "fastapi>=0.110" \
         "uvicorn[standard]>=0.29" "pydantic>=2.6" "pydantic-settings>=2.2" \
         "Faker>=25.0" "boto3>=1.34" "tenacity>=8.2"
