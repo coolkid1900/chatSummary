@@ -80,8 +80,8 @@ def fake_note(user: str) -> dict:
 
 
 def fake_summary(user: str) -> dict:
-    n = re.search(r"沟通(\d+)次", user).group(1)
-    return {"summary": f"近1个月与客户沟通{n}次，对话主要集中在基金回撤与稳健配置；客户对回撤较为敏感，"
+    assert "沟通统计" not in user  # 统计不再送给模型
+    return {"summary": "近1个月客户的对话主要集中在投资理财类的基金回撤与稳健配置；客户对回撤较为敏感，"
                        "多次主动询问下行保护及替代方案。期间客户曾比较他行理财收益，后表示已自行完成配置。"
                        "建议后续以稳健配置与长期陪伴为主线，市场波动时主动同步持仓表现。",
             "main_topics": ["基金回撤"], "suggestions": ["市场波动时主动同步持仓表现"]}
@@ -217,7 +217,7 @@ class ContactSummaryIntegrationTests(unittest.TestCase):
         summaries = {s.customer_id: s for s in self.query(ContactSummary)}
         c1 = summaries[C1]
         self.assertEqual(c1.status, "success")
-        self.assertIn("沟通8次", c1.summary)
+        self.assertNotRegex(c1.summary, r"沟通\d+次")
         self.assertEqual(c1.stats_json["session_count"], 8)
         self.assertEqual(c1.stats_json["business_days"], 7)
         status = {s["code"]: s["status"] for s in c1.signals_json}

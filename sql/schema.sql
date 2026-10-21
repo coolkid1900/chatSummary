@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS contact_signal_events (
   created_at         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_cse_pair_date (manager_id, customer_id, event_date),
-  KEY idx_cse_mgr_code (manager_id, signal_code, status)
+  KEY idx_cse_mgr_code_date (manager_id, signal_code, event_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 日笔记批次：manager_id='' 为夜间全量，有值为某位经理补数。
