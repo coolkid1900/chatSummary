@@ -1,11 +1,11 @@
 """第二层：月度总结（Prompt B）。
 
 输入全部由代码拼装，不调用模型：
-- 沟通统计：contact_daily_stats 求和（含寒暄）；
+- 沟通统计：contact_daily_stats 求和（含寒暄），只存入 stats_json 供接口与后续使用，不送给模型；
 - 信号时间线：已核实、且所属笔记成功的信号事件，按日期汇总最终状态；
 - 待跟进 / 每日笔记：status=ok 的日笔记。
 input_fp 不变且已有成功结果时直接复用；窗口内所有天都已分析且没有业务内容时套模板，不调用模型；没有可用笔记又有未分析的天时不生成。
-模型输出经代码校验（沟通次数、字数、数字来源、PII、内部用语），失败时带上原因重试一次，仍失败标记为 review。
+模型输出经代码校验（不含沟通次数、字数、数字来源、PII、内部用语），失败时带上原因重试一次，仍失败标记为 review。
 """
 from __future__ import annotations
 
@@ -164,14 +164,10 @@ def build_summary_input(window_start: date, window_end: date, stat_rows, notes, 
              "msg_count": agg.msg_count,
              "last_contact": agg.last_contact.isoformat() if agg.last_contact else None,
              "last_contact_period": period_label(agg.last_contact) if agg.last_contact else None}
-    stats_line = (f"沟通{agg.session_count}次（客户主动发起{agg.customer_initiated}次），"
-                  f"涉及{agg.active_days}天（其中{len(ok_notes)}天有业务内容）")
-    if agg.last_contact:
-        stats_line += f"，最近一次联系为{period_label(agg.last_contact)}"
     priority_dates = {e.event_date for e in events} | {n.note_date for n in ok_notes if n.facts or n.pending}
     user = build_summary_user(
         f"{window_start.isoformat()} ～ {window_end.isoformat()}（{window_label(window_days)}）",
-        stats_line, signal_lines(timeline),
+        signal_lines(timeline),
         [f"- {period_label(date.fromisoformat(p['date']))}：{p['item']}" for p in pending],
         fit_note_lines(ok_notes, priority_dates, notes_budget))
     system = build_summary_system(window_days)
@@ -182,13 +178,16 @@ def build_summary_input(window_start: date, window_end: date, stat_rows, notes, 
 
 
 def template_summary(inp: SummaryInput, window_days: int) -> str:
-    return f"{window_label(window_days)}与客户沟通{inp.stats['session_count']}次，以日常问候为主，暂未涉及业务诉求。"
+    return f"{window_label(window_days)}与客户的沟通以日常问候为主，暂未涉及业务诉求。"
 
 
 _NUMBER = re.compile(r"\d+(?:\.\d+)?\s*(?:%|％|万|元|亿)")
 # 内部用语与判断过程不得出现在给经理看的正文里
 _FORBIDDEN = ("系统", "笔记", "标签", "持续中", "仍在持续", "已确认", "证据", "客户特点", "业务内容")
 _CODE = re.compile(r"(?<![A-Za-z0-9])[A-Z]+_[A-Z_]+(?![A-Za-z0-9])")  # 标签代码
+# 总结不再输出沟通次数（统计仍保存在 stats_json 中）
+_CONTACT_COUNT = re.compile(r"(?:沟通|联系|对话|发起)\s*[0-9零一二三四五六七八九十两百]+[余多]?\s*次"
+                            r"|[0-9零一二三四五六七八九十两百]+[余多]?\s*次(?:沟通|联系|对话)")
 
 
 def validate_summary(data: dict, inp: SummaryInput,
@@ -197,9 +196,9 @@ def validate_summary(data: dict, inp: SummaryInput,
     summary = " ".join(str(data.get("summary") or "").split())
     if not summary:
         raise ValueError("summary 为空")
-    n = inp.stats["session_count"]
-    if f"沟通{n}次" not in summary:
-        raise ValueError(f"沟通次数与统计（{n}次）不一致")
+    counts = _CONTACT_COUNT.findall(summary)
+    if counts:
+        raise ValueError(f"出现沟通次数：{'、'.join(counts)}，请删去次数")
     min_chars, max_chars, target = length_range(inp.business_days)
     if len(summary) > (max_chars if strict_length else int(max_chars * 1.5)):
         raise ValueError(f"字数 {len(summary)} 超过上限，请压缩到 {target} 字以内")

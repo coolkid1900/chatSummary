@@ -205,8 +205,10 @@ class SummaryInputTests(unittest.TestCase):
         inp = self.example()
         self.assertEqual(inp.stats["session_count"], 10)
         self.assertEqual((inp.business_days, inp.incomplete_days), (7, 0))
-        self.assertIn("沟通10次（客户主动发起9次），涉及9天（其中7天有业务内容），最近一次联系为8月中旬",
-                      inp.user_prompt)
+        # 统计仍计算并保存，但不再送给模型
+        self.assertEqual((inp.stats["customer_initiated"], inp.stats["last_contact"]), (9, "2026-08-18"))
+        self.assertNotIn("沟通统计", inp.user_prompt)
+        self.assertNotIn("10次", inp.user_prompt)
         self.assertIn("深层需求：\n- 风险敏感型：多次出现（4天）；7月下旬起，最近8月中旬；依据：“原话”", inp.user_prompt)
         self.assertIn("- 传承焦虑型：已关闭；7月下旬出现 → 8月中旬关闭，依据：“传承那块上周已经跟律师办妥了”",
                       inp.user_prompt)
@@ -255,13 +257,13 @@ class SummaryInputTests(unittest.TestCase):
     def test_template_text(self):
         inp = build_summary_input(date(2026, 7, 21), date(2026, 8, 19), [stat("2026-08-01", 3)],
                                   [note("2026-08-01", status="no_business")], [], 30, 2500, "m")
-        self.assertEqual(template_summary(inp, 30), "近1个月与客户沟通3次，以日常问候为主，暂未涉及业务诉求。")
+        self.assertEqual(template_summary(inp, 30), "近1个月与客户的沟通以日常问候为主，暂未涉及业务诉求。")
 
 
 class ValidateSummaryTests(unittest.TestCase):
     def setUp(self):
         self.inp = SummaryInputTests().example()
-        self.text = ("近1个月与客户沟通10次，对话主要集中在基金回撤与稳健配置；客户对回撤较为敏感，多次主动询问下行保护。"
+        self.text = ("近1个月客户的对话主要集中在基金回撤与稳健配置，涉及投资理财与人生规划；客户对回撤较为敏感，多次主动询问下行保护。"
                      "8月中旬客户明确提及传承安排已办妥，相关焦虑信号已关闭。建议市场波动时主动同步持仓表现，"
                      "并确认此前承诺的持仓报告是否已发送。")
 
@@ -272,9 +274,11 @@ class ValidateSummaryTests(unittest.TestCase):
         self.assertEqual(summary, self.text)
         self.assertEqual(topics, ["基金回撤", "稳健配置", "财富传承"])
 
-    def test_count_must_match_stats(self):
-        with self.assertRaisesRegex(ValueError, "沟通次数"):
-            validate_summary({"summary": self.text.replace("10次", "12次")}, self.inp)
+    def test_contact_count_rejected(self):
+        for text in ("近1个月与客户沟通10次，", "客户主动发起9次，", "近1个月沟通十余次，"):
+            with self.assertRaisesRegex(ValueError, "沟通次数"):
+                validate_summary({"summary": text + self.text}, self.inp)
+        validate_summary({"summary": self.text.replace("多次主动", "曾2次主动")}, self.inp)  # 非沟通次数的“次”不受影响
 
     def test_numbers_must_come_from_input(self):
         validate_summary({"summary": self.text + "整体回撤约1.8%。"}, self.inp)
@@ -283,7 +287,7 @@ class ValidateSummaryTests(unittest.TestCase):
 
     def test_length_and_pii(self):
         with self.assertRaisesRegex(ValueError, "少于"):
-            validate_summary({"summary": "近1个月与客户沟通10次。"}, self.inp)
+            validate_summary({"summary": "近1个月客户关注基金回撤。"}, self.inp)
         with self.assertRaisesRegex(ValueError, "压缩到 300 字以内"):
             validate_summary({"summary": self.text * 4}, self.inp)
         longer = self.text + "建议后续结合客户对回撤的敏感，在市场波动时主动同步持仓表现。" * 9
@@ -399,7 +403,7 @@ class LlmTruncationTests(unittest.TestCase):
 class SummaryLeakTests(unittest.TestCase):
     def test_internal_terms_rejected(self):
         inp = SummaryInputTests().example()
-        text = ("近1个月与客户沟通10次，对话主要集中在基金回撤与稳健配置；客户对回撤较为敏感，"
+        text = ("近1个月客户的对话主要集中在基金回撤与稳健配置，涉及投资理财与人生规划；客户对回撤较为敏感，"
                 "多次主动询问下行保护。8月中旬客户明确提及传承安排已办妥，相关焦虑信号已关闭。"
                 "建议市场波动时主动同步持仓表现。")
         with self.assertRaisesRegex(ValueError, "内部用语"):
@@ -433,12 +437,12 @@ class SummaryRetryFeedbackTests(unittest.TestCase):
         from app.contacts.llm import LlmResult
 
         records = ([stat("2026-08-01", sessions=2)], [note("2026-08-01", points=["询问大额存单利率"])], [])
-        good = "近1个月与客户沟通2次，客户曾询问大额存单利率及起存条件，关注存款类产品。建议结合客户资金期限介绍合适的存款产品。"
+        good = "近1个月客户关注存款类产品，曾询问大额存单利率及起存条件。建议结合客户资金期限与流动性安排，介绍合适的存款产品。"
         prompts = []
 
         def chat_json(**kw):
             prompts.append(kw["user"])
-            text = "近1个月与客户沟通5次。" if len(prompts) == 1 else good
+            text = "近1个月与客户沟通2次，" + good[4:] if len(prompts) == 1 else good
             return LlmResult(data={"summary": text}, call_id=f"c{len(prompts)}", prompt_tokens=100)
 
         llm = SimpleNamespace(chat_json=chat_json)
@@ -449,7 +453,7 @@ class SummaryRetryFeedbackTests(unittest.TestCase):
             outcome = summary.summarize_pair("m", "c", date(2026, 8, 19), llm=llm)
         self.assertEqual(outcome.kind, "success")
         self.assertNotIn("修改要求", prompts[0])
-        self.assertIn("【修改要求】上一次输出未通过检查：沟通次数与统计（2次）不一致", prompts[1])
+        self.assertIn("【修改要求】上一次输出未通过检查：出现沟通次数：沟通2次，请删去次数", prompts[1])
         self.assertEqual(save.call_args.args[3]["summary"], good)
 
 
@@ -466,3 +470,12 @@ class PromptRuleTests(unittest.TestCase):
         from app.contacts.prompts import NOTE_SYSTEM
 
         self.assertIn("不标 INV_FAMILY_TRUST、INV_INS_TRUST", NOTE_SYSTEM)
+
+
+class SchemaTests(unittest.TestCase):
+    def test_signal_index_covers_cross_customer_query(self):
+        from app.models import ContactSignalEvent
+
+        indexes = {ix.name: [c.name for c in ix.columns] for ix in ContactSignalEvent.__table__.indexes}
+        self.assertEqual(indexes["idx_cse_mgr_code_date"], ["manager_id", "signal_code", "event_date"])
+        self.assertNotIn("idx_cse_mgr_code", indexes)

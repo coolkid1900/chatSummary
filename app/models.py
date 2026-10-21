@@ -184,7 +184,8 @@ class ContactSignalEvent(Base):
 
     __table_args__ = (
         Index("idx_cse_pair_date", "manager_id", "customer_id", "event_date"),
-        Index("idx_cse_mgr_code", "manager_id", "signal_code", "status"),
+        # 跨客户信号查询按 (经理, 信号, 日期范围) 过滤；status 在代码里汇总，不参与查询
+        Index("idx_cse_mgr_code_date", "manager_id", "signal_code", "event_date"),
     )
 
 
