@@ -2,6 +2,8 @@
 
 incremental 先固定 PCA，再训练 KMeans，最终标签统一驱动热度、词频和代表池。
 向量工作集按批次读取；客户集合与主题词表仍随数据规模增长。
+每个会话的归类结果也保留下来（session_ids / session_topics），合并后换算成最终主题，
+落盘给部门热点按名单切片使用。
 """
 from __future__ import annotations
 
@@ -66,6 +68,17 @@ class ClusterResult:
     _rng: random.Random = field(default_factory=lambda: random.Random(42), repr=False)
     n_topics: int = 0
     _seen: dict[int, int] = field(default_factory=dict)
+    # 已归类会话及其合并前的主题；final_assignments() 换算为合并后的编号。
+    session_ids: list[str] = field(default_factory=list)
+    session_topics: list[int] = field(default_factory=list)
+
+    def final_assignments(self) -> tuple[list[str], list[int]]:
+        canon = {m: topic for topic, members in self.members_by_topic.items() for m in members}
+        return self.session_ids, [canon.get(t, t) for t in self.session_topics]
+
+    def centroids(self) -> dict[int, np.ndarray]:
+        """各主题全体会话的平均向量（合并后）。"""
+        return {t: self.vector_sums[t] / max(1, self._seen.get(t, 0)) for t in self.vector_sums}
 
     def _add_repr(self, topic: int, text: str, vec: np.ndarray, cap: int) -> None:
         seen = self._seen.get(topic, 0)
@@ -196,9 +209,13 @@ def merge_similar_topics(result: ClusterResult, threshold: float, method: str | 
 
 def _accumulate(result: ClusterResult, batch: Batch, topics: list[int], cap: int) -> None:
     has_customer = bool(batch["customer"])
+    has_session = bool(batch["session_id"])
     for i, topic in enumerate(topics):
         if topic == -1:
             continue
+        if has_session:
+            result.session_ids.append(batch["session_id"][i])
+            result.session_topics.append(topic)
         result.heat_by_topic[topic] = result.heat_by_topic.get(topic, 0) + int(batch["msg_count"][i])
         vector = batch["vectors"][i]
         if topic not in result.vector_sums:
@@ -223,8 +240,9 @@ def run_clustering(date_str: str) -> ClusterResult:
     if settings.cluster_backend != "umap_hdbscan":
         raise ValueError(f"未知 CLUSTER_BACKEND: {settings.cluster_backend}")
 
-    tokens, texts, vecs, counts, custs = [], [], [], [], []
+    tokens, texts, vecs, counts, custs, sids = [], [], [], [], [], []
     for b in store.iter_batches(date_str):
+        sids.extend(b["session_id"])
         tokens.extend(b["tokens"])
         texts.extend(b["text"])
         counts.extend(b["msg_count"])
@@ -236,7 +254,7 @@ def run_clustering(date_str: str) -> ClusterResult:
     del vecs
     topic_model = build_topic_model(build_vectorizer(online=False))
     topics, _ = topic_model.fit_transform(tokens, embeddings=embeddings)
-    pseudo = Batch(session_id=[], text=texts, tokens=tokens, msg_count=counts,
+    pseudo = Batch(session_id=sids, text=texts, tokens=tokens, msg_count=counts,
                    customer=custs, vectors=embeddings)
     _accumulate(result, pseudo, [int(t) for t in topics], cap)
     result.topic_model = topic_model

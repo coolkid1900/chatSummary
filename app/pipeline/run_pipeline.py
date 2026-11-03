@@ -3,12 +3,13 @@
 每日批量主题挖掘（incremental 分批训练；客户集合和词表仍随数据增长）：
   MySQL 流式取数 → 预处理/会话聚合/PII脱敏 → bge-m3 嵌入(限流+缓存)
   → jieba 多进程分词 + 分片 parquet 落盘 → 降维+聚类(fit/transform分离)
-  → c-TF-IDF 热词 → 代表文档 MMR 采样 → DeepSeek 意图概括+业务词
-  → 结果写回 MySQL + Redis 缓存。
+  → c-TF-IDF 热词 → 代表文档 MMR 采样 → DeepSeek 意图概括+业务词（全部主题，存主题目录）
+  → 会话分配/主题质心落盘 → TOP N 写回 MySQL + Redis 缓存 → （可选）按部门切片统计。
 
 用法：
     python -m app.pipeline.run_pipeline --date 2026-06-27           # 跑指定日期
     python -m app.pipeline.run_pipeline --date 2026-06-27 --force   # 忽略已存在分片，强制重嵌入
+    python -m app.pipeline.run_pipeline --date 2026-06-27 --departments D1001,D1002
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from app.config import get_settings
 from app.obs import RunState, setup_logging
 from app.pipeline.cluster import run_clustering
 from app.pipeline.embedding import Embedder
-from app.pipeline.hotwords import rank_topics
+from app.pipeline.hotwords import all_topics
 from app.pipeline.ingest import iter_customer_messages
 from app.pipeline.intent import IntentSummarizer
 from app.pipeline.persist import save_results
@@ -90,7 +91,8 @@ def _embed_and_shard(date_str: str, state: RunState) -> None:
     )
 
 
-def run(date_str: str, force: bool, run_id: str | None = None) -> None:
+def run(date_str: str, force: bool, run_id: str | None = None,
+        department_ids: list[str] | None = None) -> None:
     settings = get_settings()
     state = RunState(date_str, settings.cluster_backend, run_id=run_id)
     state.start()
@@ -133,26 +135,41 @@ def run(date_str: str, force: bool, run_id: str | None = None) -> None:
                  result.metrics.get("rejected_sessions", 0))
         if result.n_topics == 0:
             log.warning("无主题（可能无数据），结束。")
+            if department_ids:
+                log.warning("当天无主题，跳过部门热点：%s", department_ids)
             state.success()
             return
 
-        # 热词 + 热度排序
-        hot_topics = rank_topics(result)
-        log.info("热词+排序: TOP %d", len(hot_topics))
+        # 热词 + 热度排序。全部主题都要概括意图写入主题目录：部门榜单可能用到全公司 TOP N 以外的主题。
+        topics = all_topics(result)
+        log.info("热词+排序: %d 个主题，TOP %d 入全公司榜", len(topics), min(len(topics), settings.top_n))
 
         # 意图概括 + 业务词筛选（代表文档 MMR 采样）。按主题并发调用 DeepSeek，
         # 并发度由 LLM 令牌桶约束在 n/s（主题数几十~上百，串行是 wall-clock 瓶颈）。
         summarizer = IntentSummarizer()
         workers = max(1, settings.llm_concurrency)
-        if len(hot_topics) > 1 and workers > 1:
+        if len(topics) > 1 and workers > 1:
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                summaries = list(ex.map(summarizer.summarize, hot_topics))
+                summaries = list(ex.map(summarizer.summarize, topics))
         else:
-            summaries = [summarizer.summarize(th) for th in hot_topics]
+            summaries = [summarizer.summarize(th) for th in topics]
 
+        catalog = [
+            {
+                "topic_id": int(th.topic_id),
+                "session_count": int(th.session_count),
+                "heat": int(th.heat),
+                "customer_count": int(th.customer_count),
+                "hot_words": [[w, round(s, 4)] for w, s in th.hot_words],
+                "business_words": business_words,
+                "customer_intent": intent,
+                "representative_docs": repr_docs,
+            }
+            for th, (intent, business_words, repr_docs) in zip(topics, summaries)
+        ]
         results: list[dict] = []
         for rank, (th, (intent, business_words, repr_docs)) in enumerate(
-            zip(hot_topics, summaries), start=1
+            zip(topics[: settings.top_n], summaries), start=1
         ):
             results.append({
                 "date": date_str,
@@ -172,16 +189,30 @@ def run(date_str: str, force: bool, run_id: str | None = None) -> None:
         surge_count = enrich_with_trend(date_str, results)
         log.info("环比/突增完成 (突增 %d 个主题)", surge_count)
 
+        # 聚类产物先落盘、主题目录后入库：两者 run_id 一致才可供部门统计使用。
+        get_vector_store().write_topic_artifacts(date_str, state.run_id, *result.final_assignments(),
+                                                 result.centroids())
+
         # 落库 + 缓存
-        save_results(date_str, results)
-        state.success()
-        log.info("落库 %d 条热点, 耗时 %.1fs", len(results), time.time() - state.t0)
+        save_results(date_str, results, run_id=state.run_id, catalog=catalog)
+        log.info("落库 %d 条热点、%d 个主题目录, 耗时 %.1fs", len(results), len(catalog),
+                 time.time() - state.t0)
         for r in results[:5]:
             words = "、".join(r["business_words"][:3])
             pct = "新" if r["is_new"] else f"{r['heat_change_pct']:+.0%}"
             surge = " ⚡突增" if r["is_surge"] else ""
             log.info("  #%d heat=%d 客户%d 环比%s%s [%s] %s",
                      r["rank"], r["heat"], r["customer_count"], pct, surge, words, r["customer_intent"])
+
+        # 部门热点在释放日期锁之前完成，避免与同日期重跑交叉；失败不影响全公司结果。
+        if department_ids:
+            from app.departments.hotspot import run_departments
+
+            try:
+                run_departments(date_str, department_ids, run_id=f"{state.run_id}-dept")
+            except Exception:
+                log.exception("部门热点失败 run_id=%s", state.run_id)
+        state.success()
     except Exception as e:
         state.failed(repr(e))
         log.exception("pipeline failed: %s", e)
@@ -194,8 +225,10 @@ def main() -> None:
     ap.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
     ap.add_argument("--force", action="store_true", help="忽略已存在分片，强制重新嵌入")
     ap.add_argument("--run-id", default=None, help="外部指定 run_id（HTTP 触发时由 API 传入）")
+    ap.add_argument("--departments", default="", help="逗号分隔的部门 id，全公司完成后按部门统计")
     args = ap.parse_args()
-    run(args.date, args.force, run_id=args.run_id)
+    departments = [d.strip() for d in args.departments.split(",") if d.strip()]
+    run(args.date, args.force, run_id=args.run_id, department_ids=departments or None)
 
 
 if __name__ == "__main__":

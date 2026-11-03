@@ -55,7 +55,8 @@ class Settings(BaseSettings):
     # 聚类后端（§6.0）
     cluster_backend: str = "incremental"  # incremental | umap_hdbscan
     n_components: int = Field(default=10, gt=0)
-    n_clusters: int = Field(default=50, gt=0)
+    # 主题切细一些，部门特有的小话题才能单独成簇；相近的再由 TOPIC_MERGE_SIM 合并。
+    n_clusters: int = Field(default=150, gt=0)
     incremental_n_components: int | None = Field(default=None, gt=0)
     incremental_epochs: int = Field(default=3, gt=0)
     incremental_init_sample_size: int = Field(default=4096, gt=0)
@@ -113,7 +114,8 @@ class Settings(BaseSettings):
     contact_llm_token_safety: float = Field(default=0.9, gt=0, le=1)  # 估算误差余量
     contact_llm_concurrency: int = Field(default=6, gt=0)
     contact_llm_timeout: float = Field(default=60, gt=0)
-    # 原样附加到请求体的厂商参数（JSON）。推理 token 计入 max_tokens 且拖慢响应，结构化抽取不需要推理：
+    # 原样附加到请求体的厂商参数（JSON），热点意图概括也使用（同一 LLM_MODEL）。
+    # 推理 token 计入 max_tokens 且拖慢响应，结构化抽取不需要推理：
     # DeepSeek 用 {"thinking": {"type": "disabled"}}；GLM 不能关闭推理，用 {"reasoning_effort": "low"}；不需要时设为 {}
     contact_llm_extra_body: dict = Field(default_factory=lambda: {"thinking": {"type": "disabled"}})
     # 发送前的输入 token 估算系数，需按 llm_calls 中实际 prompt_tokens 校准。
@@ -129,6 +131,28 @@ class Settings(BaseSettings):
     contact_job_lease_seconds: int = Field(default=600, gt=0)  # 心跳超时后任务可被其他 worker 接管
     contact_nightly_enabled: bool = False  # worker 每天自动提交前一天的日笔记批次
     contact_nightly_hour: int = Field(default=1, ge=0, le=23)
+
+    # 部门热点：全公司聚类一次，按部门经理名单切片统计（见 app/departments/）。
+    # 名单接口：POST JSON {department_id, page(从 1 开始), page_size} → {total, manager_ids}，
+    # 返回部门（含全部子部门）的客户经理 id；本地可指向 /mock/departments/managers。
+    department_roster_url: str = ""
+    department_roster_token: str = ""  # 非空时放在 Authorization: Bearer 头
+    department_roster_page_size: int = Field(default=500, ge=1, le=5000)
+    department_roster_timeout: float = Field(default=15, gt=0)
+    department_roster_max_pages: int = Field(default=1000, ge=1)
+    department_mock_enabled: bool = False  # 开启 /mock/departments/managers，仅本地联调
+    department_mock_file: str = "/app/data/mock_departments.json"
+    department_max_per_request: int = Field(default=50, ge=1)
+    # 入榜门槛按部门规模：会话数 ≥ max(最小会话数, 部门会话数 × 占比)，过滤小部门噪声。
+    department_min_topic_sessions: int = Field(default=3, ge=1)
+    department_min_topic_share: float = Field(default=0.005, ge=0, le=1)
+    # 用本部门代表原文重新概括意图；关闭或调用失败时沿用当天主题目录里的全公司意图。
+    department_local_intent: bool = True
+    # 部门在某主题内的会话质心与全公司主题质心的余弦相似度低于此值，视为“被吞没”，
+    # 在部门内细分该主题；0 关闭。需按日志里的相似度分布校准。
+    department_drift_sim: float = Field(default=0.9, ge=0, le=1)
+    department_split_min_sessions: int = Field(default=30, ge=4)  # 会话数达到才检测与细分
+    department_split_max_k: int = Field(default=3, ge=2)
 
     worker_id: str = "local"
 

@@ -28,14 +28,24 @@ class Base(DeclarativeBase):
 
 
 class DailyHotTopic(Base):
-    """每日 TOP 热点结果（§13）。按 date 查询；hot_words / representative_docs 存 JSON 文本。"""
+    """每日 TOP 热点结果（§13）。按 date 查询；hot_words / representative_docs 存 JSON 文本。
+
+    全公司榜单 scope=(global, all)；部门榜单 scope=(department, 部门 id)，热度、客户数、
+    热词与代表原文只统计本部门经理的会话。
+    """
 
     __tablename__ = "daily_hot_topics"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     stat_date: Mapped[str] = mapped_column(String(10), index=True)  # YYYY-MM-DD
+    scope_type: Mapped[str] = mapped_column(String(16), default="global", server_default="global")
+    scope_id: Mapped[str] = mapped_column(String(64), default="all", server_default="all")
+    run_id: Mapped[str] = mapped_column(String(64), default="", server_default="")
     rank: Mapped[int] = mapped_column(Integer)
+    # 当天主题目录（daily_topic_catalog）的编号；部门内细分出的子主题为部门内新编号，
+    # 其所属的全公司主题记在 parent_topic_id。
     topic_id: Mapped[int] = mapped_column(Integer)
+    parent_topic_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     heat: Mapped[int] = mapped_column(Integer)  # 该主题客户消息数
     customer_count: Mapped[int] = mapped_column(Integer, default=0)  # 涉及去重客户数（广度）
     prev_heat: Mapped[int] = mapped_column(Integer, default=0)       # 昨日同主题热度（环比基数）
@@ -46,13 +56,40 @@ class DailyHotTopic(Base):
     # 大模型从 hot_words 中筛出的「有业务意义」热词。JSON: ["提前还款","违约金"]
     business_words: Mapped[str] = mapped_column(Text, default="[]")
     customer_intent: Mapped[str] = mapped_column(Text)
+    # global：沿用全公司主题目录的意图；department：用本部门代表原文重新概括。
+    intent_source: Mapped[str] = mapped_column(String(16), default="global", server_default="global")
     representative_docs: Mapped[str] = mapped_column(Text)  # JSON: ["...","..."]
     cluster_backend: Mapped[str] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
-        Index("uq_date_rank", "stat_date", "rank", unique=True),
+        Index("uq_scope_date_rank", "stat_date", "scope_type", "scope_id", "rank", unique=True),
     )
+
+
+class DailyTopicCatalog(Base):
+    """当天全公司聚类出的全部主题（不止 TOP N），供部门榜单查热词、业务词与意图。
+
+    主题编号每次聚类都会变化，某天重跑全公司后整天替换，与向量目录里的会话分配文件一一对应。
+    """
+
+    __tablename__ = "daily_topic_catalog"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    stat_date: Mapped[str] = mapped_column(String(10))
+    topic_id: Mapped[int] = mapped_column(Integer)
+    session_count: Mapped[int] = mapped_column(Integer, default=0)
+    heat: Mapped[int] = mapped_column(Integer, default=0)  # 客户消息数
+    customer_count: Mapped[int] = mapped_column(Integer, default=0)
+    hot_words: Mapped[str] = mapped_column(Text)
+    business_words: Mapped[str] = mapped_column(Text)
+    customer_intent: Mapped[str] = mapped_column(Text)
+    representative_docs: Mapped[str] = mapped_column(Text)
+    run_id: Mapped[str] = mapped_column(String(64))
+    cluster_backend: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("stat_date", "topic_id", name="uq_catalog_date_topic"),)
 
 
 class Lexicon(Base):

@@ -7,6 +7,9 @@
 
 分片即「当天最贵的 embedding 结果」的持久化，重跑可直接复用（断点续跑，技术优化5）。
 按日期分目录，文件名带 worker_id 防并发写冲突；local / s3 两后端可切换（§9）。
+
+同目录还存聚类产物（topic-*），供部门热点按名单切片：会话→最终主题、各主题向量质心，
+manifest 最后写，记录产生它们的 run_id。分片只认 shard-*.parquet，聚类产物不会被当成分片读。
 """
 from __future__ import annotations
 
@@ -28,6 +31,10 @@ from app.config import get_settings
 MANIFEST = "_manifest.json"
 PIPELINE_VERSION = "hotspot-v2"
 
+TOPIC_ASSIGNMENTS = "topic-assignments.parquet"
+TOPIC_CENTROIDS = "topic-centroids.parquet"
+TOPIC_MANIFEST = "topic-manifest.json"
+
 # parquet 显式 schema：vector 用定长 float32 list
 SCHEMA = pa.schema(
     [
@@ -39,6 +46,20 @@ SCHEMA = pa.schema(
         ("vector", pa.list_(pa.float32())),
     ]
 )
+
+
+ASSIGNMENT_SCHEMA = pa.schema([("session_id", pa.string()), ("topic_id", pa.int32())])
+CENTROID_SCHEMA = pa.schema([("topic_id", pa.int32()), ("vector", pa.list_(pa.float32()))])
+
+
+def _is_shard(name: str) -> bool:
+    base = name.rsplit("/", 1)[-1]
+    return base.startswith("shard-") and base.endswith(".parquet")
+
+
+def session_staff(session_id: str) -> str:
+    """session_id = 经理:客户:序号（见 preprocess.SessionUnit）。"""
+    return session_id.split(":", 1)[0]
 
 
 class Record(TypedDict):
@@ -150,7 +171,57 @@ def _record_batch(rb: pa.RecordBatch) -> Batch:
     )
 
 
-class LocalVectorStore:
+def _parquet_bytes(table: pa.Table) -> bytes:
+    buf = io.BytesIO()
+    pq.write_table(table, buf)
+    return buf.getvalue()
+
+
+class _TopicArtifacts:
+    """聚类产物读写；后端只需提供 _put_bytes / _get_bytes / _delete。"""
+
+    def write_topic_artifacts(self, date_str: str, run_id: str, session_ids: list[str],
+                              topic_ids: list[int], centroids: dict[int, np.ndarray]) -> None:
+        # 先撤销旧标记：写到一半崩溃时，部门统计不会读到新旧混杂的产物。
+        self._delete(date_str, TOPIC_MANIFEST)
+        self._put_bytes(date_str, TOPIC_ASSIGNMENTS, _parquet_bytes(pa.table(
+            {"session_id": session_ids, "topic_id": pa.array(topic_ids, type=pa.int32())},
+            schema=ASSIGNMENT_SCHEMA)))
+        topics = sorted(centroids)
+        self._put_bytes(date_str, TOPIC_CENTROIDS, _parquet_bytes(pa.table(
+            {"topic_id": pa.array(topics, type=pa.int32()),
+             "vector": pa.array([np.asarray(centroids[t], dtype=np.float32).tolist() for t in topics],
+                                type=pa.list_(pa.float32()))},
+            schema=CENTROID_SCHEMA)))
+        self._put_bytes(date_str, TOPIC_MANIFEST, json.dumps(
+            {"run_id": run_id, "n_sessions": len(session_ids), "n_topics": len(topics),
+             "finished_at": datetime.utcnow().isoformat()}, ensure_ascii=False).encode("utf-8"))
+
+    def read_topic_manifest(self, date_str: str) -> dict | None:
+        body = self._get_bytes(date_str, TOPIC_MANIFEST)
+        return json.loads(body) if body is not None else None
+
+    def read_topic_assignments(self, date_str: str, staff: set[str] | None = None) -> dict[str, int]:
+        """会话→最终主题；给定 staff 时只保留这些经理的会话。"""
+        body = self._get_bytes(date_str, TOPIC_ASSIGNMENTS)
+        if body is None:
+            return {}
+        table = pq.read_table(io.BytesIO(body))
+        pairs = zip(table.column("session_id").to_pylist(), table.column("topic_id").to_pylist())
+        if staff is None:
+            return dict(pairs)
+        return {sid: topic for sid, topic in pairs if session_staff(sid) in staff}
+
+    def read_topic_centroids(self, date_str: str) -> dict[int, np.ndarray]:
+        body = self._get_bytes(date_str, TOPIC_CENTROIDS)
+        if body is None:
+            return {}
+        table = pq.read_table(io.BytesIO(body))
+        vectors = _arrow_vectors(table.column("vector").combine_chunks())
+        return dict(zip(table.column("topic_id").to_pylist(), vectors))
+
+
+class LocalVectorStore(_TopicArtifacts):
     def __init__(self):
         self.settings = get_settings()
         self.base = self.settings.vector_store_dir
@@ -162,7 +233,7 @@ class LocalVectorStore:
         d = self._dir(date_str)
         if not os.path.isdir(d):
             return 0
-        return sum(1 for f in os.listdir(d) if f.endswith(".parquet"))
+        return sum(1 for f in os.listdir(d) if _is_shard(f))
 
     def clear(self, date_str: str) -> None:
         """删除该日期全部分片与标记（重嵌前清场，避免残留/seq 冲突）。"""
@@ -209,7 +280,7 @@ class LocalVectorStore:
     def rewrite_tokens(self, date_str: str, retok_fn) -> int:
         """复用已落盘向量，仅用 retok_fn 重算 tokens 列并原子写回，刷新 manifest。"""
         d = self._dir(date_str)
-        files = sorted(f for f in os.listdir(d) if f.endswith(".parquet")) if os.path.isdir(d) else []
+        files = sorted(f for f in os.listdir(d) if _is_shard(f)) if os.path.isdir(d) else []
         total = 0
         for f in files:
             path = os.path.join(d, f)
@@ -253,9 +324,30 @@ class LocalVectorStore:
         d = self._dir(date_str)
         if not os.path.isdir(d):
             return
-        for f in sorted(x for x in os.listdir(d) if x.endswith(".parquet")):
+        for f in sorted(x for x in os.listdir(d) if _is_shard(x)):
             with pq.ParquetFile(os.path.join(d, f)) as parquet:
                 yield from parquet.iter_batches(batch_size=bs, columns=columns)
+
+    def _put_bytes(self, date_str: str, name: str, data: bytes) -> None:
+        d = self._dir(date_str)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, name)
+        with open(path + ".tmp", "wb") as f:
+            f.write(data)
+        os.replace(path + ".tmp", path)
+
+    def _get_bytes(self, date_str: str, name: str) -> bytes | None:
+        path = os.path.join(self._dir(date_str), name)
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            return f.read()
+
+    def _delete(self, date_str: str, name: str) -> None:
+        try:
+            os.remove(os.path.join(self._dir(date_str), name))
+        except FileNotFoundError:
+            pass
 
     def cleanup_expired(self) -> None:
         if not os.path.isdir(self.base):
@@ -270,7 +362,7 @@ class LocalVectorStore:
                 shutil.rmtree(os.path.join(self.base, name), ignore_errors=True)
 
 
-class S3VectorStore:
+class S3VectorStore(_TopicArtifacts):
     """S3 兼容对象存储后端。过期清理交给 bucket lifecycle 规则（见 README）。"""
 
     def __init__(self):
@@ -293,7 +385,7 @@ class S3VectorStore:
         n = 0
         paginator = self.client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket, Prefix=self._prefix(date_str)):
-            n += sum(1 for o in page.get("Contents", []) if o["Key"].endswith(".parquet"))
+            n += sum(1 for o in page.get("Contents", []) if _is_shard(o["Key"]))
         return n
 
     def clear(self, date_str: str) -> None:
@@ -342,7 +434,7 @@ class S3VectorStore:
         keys: list[str] = []
         paginator = self.client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket, Prefix=self._prefix(date_str)):
-            keys += [o["Key"] for o in page.get("Contents", []) if o["Key"].endswith(".parquet")]
+            keys += [o["Key"] for o in page.get("Contents", []) if _is_shard(o["Key"])]
         return sorted(keys)
 
     def rewrite_tokens(self, date_str: str, retok_fn) -> int:
@@ -397,6 +489,18 @@ class S3VectorStore:
                         yield from parquet.iter_batches(batch_size=bs, columns=columns)
             finally:
                 body.close()
+
+    def _put_bytes(self, date_str: str, name: str, data: bytes) -> None:
+        self.client.put_object(Bucket=self.bucket, Key=self._prefix(date_str) + name, Body=data)
+
+    def _get_bytes(self, date_str: str, name: str) -> bytes | None:
+        try:
+            return self.client.get_object(Bucket=self.bucket, Key=self._prefix(date_str) + name)["Body"].read()
+        except self.client.exceptions.NoSuchKey:
+            return None
+
+    def _delete(self, date_str: str, name: str) -> None:
+        self.client.delete_object(Bucket=self.bucket, Key=self._prefix(date_str) + name)
 
     def cleanup_expired(self) -> None:
         # 交给 bucket lifecycle；此处不主动删，避免误删并发写入。

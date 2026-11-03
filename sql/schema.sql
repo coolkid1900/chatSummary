@@ -13,26 +13,62 @@ USE chat_summary;
 -- 按业务方 DDL 幂等创建（CREATE TABLE IF NOT EXISTS），不在此处建。
 
 -- ===== 每日热点结果表（§13）=====
+-- 全公司榜单 scope=(global, all)；部门榜单 scope=(department, 部门 id)。
+-- 已有库升级（手动执行一次）：
+--   ALTER TABLE daily_hot_topics
+--     ADD COLUMN scope_type VARCHAR(16) NOT NULL DEFAULT 'global' AFTER stat_date,
+--     ADD COLUMN scope_id VARCHAR(64) NOT NULL DEFAULT 'all' AFTER scope_type,
+--     ADD COLUMN run_id VARCHAR(64) NOT NULL DEFAULT '' AFTER scope_id,
+--     ADD COLUMN parent_topic_id INT NULL AFTER topic_id,
+--     ADD COLUMN intent_source VARCHAR(16) NOT NULL DEFAULT 'global' AFTER customer_intent,
+--     DROP INDEX uq_date_rank,
+--     ADD UNIQUE KEY uq_scope_date_rank (stat_date, scope_type, scope_id, `rank`);
 CREATE TABLE IF NOT EXISTS daily_hot_topics (
   id                  BIGINT       NOT NULL AUTO_INCREMENT,
   stat_date           VARCHAR(10)  NOT NULL,   -- YYYY-MM-DD
+  scope_type          VARCHAR(16)  NOT NULL DEFAULT 'global',  -- global | department
+  scope_id            VARCHAR(64)  NOT NULL DEFAULT 'all',     -- 部门 id；全公司为 all
+  run_id              VARCHAR(64)  NOT NULL DEFAULT '',        -- 产生本行的运行编号
   `rank`              INT          NOT NULL,
-  topic_id            INT          NOT NULL,
+  topic_id            INT          NOT NULL,   -- 当天主题目录编号；部门细分子主题为部门内新编号
+  parent_topic_id     INT          NULL,       -- 部门细分子主题所属的全公司主题
   heat                INT          NOT NULL,   -- 热度 = 该主题客户消息数
   customer_count      INT          NOT NULL DEFAULT 0,   -- 涉及去重客户数（广度）
-  prev_heat           INT          NOT NULL DEFAULT 0,   -- 昨日同主题热度
+  prev_heat           INT          NOT NULL DEFAULT 0,   -- 昨日同范围同主题热度
   heat_change_pct     FLOAT        NULL,                 -- 环比涨幅，新主题为 NULL
   is_new              TINYINT(1)   NOT NULL DEFAULT 0,   -- 新出现主题
   is_surge            TINYINT(1)   NOT NULL DEFAULT 0,   -- 突增
   hot_words           TEXT         NOT NULL,   -- JSON: [["提前还款",0.41],...]
   business_words      TEXT         NOT NULL,   -- 大模型筛出的有业务意义热词 JSON: ["提前还款","违约金"]
   customer_intent     TEXT         NOT NULL,
+  intent_source       VARCHAR(16)  NOT NULL DEFAULT 'global',  -- global 沿用全公司意图 | department 部门原文重新概括
   representative_docs TEXT         NOT NULL,   -- JSON: ["...","..."]
   cluster_backend     VARCHAR(32)  NOT NULL,
   created_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
-  UNIQUE KEY uq_date_rank (stat_date, `rank`),
+  UNIQUE KEY uq_scope_date_rank (stat_date, scope_type, scope_id, `rank`),
   KEY idx_stat_date (stat_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ===== 当天主题目录 =====
+-- 全公司聚类出的全部主题（不止 TOP N），部门榜单从这里取热词、业务词和意图。
+-- 主题编号每次聚类都会变，重跑某天时整天替换，与向量目录下的会话分配文件对应。
+CREATE TABLE IF NOT EXISTS daily_topic_catalog (
+  id                  BIGINT       NOT NULL AUTO_INCREMENT,
+  stat_date           VARCHAR(10)  NOT NULL,
+  topic_id            INT          NOT NULL,
+  session_count       INT          NOT NULL DEFAULT 0,
+  heat                INT          NOT NULL DEFAULT 0,   -- 客户消息数
+  customer_count      INT          NOT NULL DEFAULT 0,
+  hot_words           TEXT         NOT NULL,
+  business_words      TEXT         NOT NULL,
+  customer_intent     TEXT         NOT NULL,
+  representative_docs TEXT         NOT NULL,
+  run_id              VARCHAR(64)  NOT NULL,
+  cluster_backend     VARCHAR(32)  NOT NULL,
+  created_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_catalog_date_topic (stat_date, topic_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ===== 词库表 =====
