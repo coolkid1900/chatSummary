@@ -15,6 +15,7 @@ DeepSeek 兼容 OpenAI 协议。按主题逐个调用（调用次数 = 主题数
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 
@@ -24,6 +25,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from app.config import get_settings
 from app.pipeline.hotwords import TopicHot
 from app.pipeline.ratelimit import TokenBucket
+
+log = logging.getLogger(__name__)
 
 
 def _mmr_select(pool: list[tuple[str, np.ndarray]], k: int, lambda_: float = 0.6) -> list[str]:
@@ -121,6 +124,7 @@ class IntentSummarizer:
             temperature=0.3,
             max_tokens=200,
             response_format={"type": "json_object"},  # 引导 DeepSeek 输出 JSON
+            **self._extra_body(),
         )
         data = self._parse_json(resp.choices[0].message.content)
         intent = str(data.get("intent", "")).strip()
@@ -129,8 +133,19 @@ class IntentSummarizer:
         business_words = [w for w in bw if w in candidate_words]
         return intent, business_words
 
+    def _extra_body(self) -> dict:
+        # 与接触总结共用同一模型的厂商参数（CONTACT_LLM_EXTRA_BODY）：推理型模型的推理 token
+        # 计入 max_tokens，200 的上限会被推理耗尽、正文为空。
+        extra = self.settings.contact_llm_extra_body
+        return {"extra_body": extra} if extra else {}
+
     def summarize(self, topic: TopicHot) -> tuple[str, list[str], list[str]]:
         """返回 (customer_intent, business_words, representative_docs)。"""
+        intent, business_words, repr_docs, _ = self.describe(topic)
+        return intent, business_words, repr_docs
+
+    def describe(self, topic: TopicHot) -> tuple[str, list[str], list[str], bool]:
+        """同 summarize，末位表示大模型是否概括成功（失败时前两项为回退值）。"""
         docs = self._pick_docs(topic)
         repr_docs = docs[: self.settings.nr_repr_docs]
         candidate_words = [w for w, _ in topic.hot_words]
@@ -141,9 +156,10 @@ class IntentSummarizer:
                 intent = f"客户关注{('、'.join(candidate_words[:3])) or '相关业务'}"
             if not business_words:  # 模型没挑出词则回退取前 3 个候选
                 business_words = candidate_words[:3]
-        except Exception:  # 单主题失败不阻断整体
+        except Exception as exc:  # 单主题失败不阻断整体
             with self._lock:
                 self.failures += 1
+            log.warning("主题 %s 意图概括失败，使用回退：%r", topic.topic_id, exc)
             intent = f"（概括失败，回退）客户关注{('、'.join(candidate_words[:3])) or '相关业务'}"
-            business_words = candidate_words[:3]
-        return intent, business_words, repr_docs
+            return intent, candidate_words[:3], repr_docs, False
+        return intent, business_words, repr_docs, True

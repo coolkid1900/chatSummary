@@ -155,6 +155,41 @@ Embedding 单条输入由 `EMBEDDING_MAX_INPUT_CHARS=7500` 限制（正整数）
 CPU 版 umap/hdbscan 随 bertopic 安装。GPU 路径需 RAPIDS `cuml`（只能经 conda / nvidia
 容器镜像安装，本仓库不内置），设 `CLUSTER_BACKEND=umap_hdbscan USE_GPU=true`。
 
+## 部门热点（全公司聚类一次，按部门名单切片）
+
+每个部门不单独重跑流水线：全公司聚类后，把**会话→主题**分配结果和各主题向量质心写到当天向量目录
+（`topic-assignments.parquet` / `topic-centroids.parquet` / `topic-manifest.json`，随向量 `VECTOR_TTL_DAYS` 过期），
+全部主题（不止 TOP N）的热词、业务词、意图写入 `daily_topic_catalog`。部门统计只读这些结果：
+
+1. 用传入的父部门 id 实时调用名单接口（`DEPARTMENT_ROSTER_URL`，分页，返回含子部门的全部经理），不落库；名单失败的部门跳过。
+2. 扫描当天分片，筛出名单内经理的会话，按主题累计热度（客户消息数）、客户数、词频和代表原文。
+3. **被吞没检测**：部门在某主题内的会话质心与全公司主题质心相似度低于 `DEPARTMENT_DRIFT_SIM`，
+   说明部门聊的是被并进大主题的另一件事，就在部门内细分（KMeans，按轮廓系数选 k），
+   子主题 `parent_topic_id` 记所属全公司主题。
+4. 热词按部门内词频重算；排序同全公司，门槛 `max(DEPARTMENT_MIN_TOPIC_SESSIONS, 部门会话数 × DEPARTMENT_MIN_TOPIC_SHARE)`。
+5. 意图用本部门代表原文重新概括（`intent_source=department`），失败或关闭时沿用全公司意图（`global`）。
+6. 环比只和同一部门昨天比；结果写 `daily_hot_topics`（`scope_type=department, scope_id=部门 id`）。
+
+没有任务表，进度和每个部门的结果摘要看日志（关键字“部门热点”）。
+
+```bash
+# 全公司统计完成后顺带统计部门
+curl -X POST localhost:8000/pipeline/run -H 'Content-Type: application/json' \
+  -d '{"date":"2026-10-27","department_ids":["D100","D200"]}'
+# 已有全公司结果时，只按部门重新切片（不重新聚类；名单变化或补算时用）
+curl -X POST localhost:8000/departments/hotspot/run -H 'Content-Type: application/json' \
+  -d '{"date":"2026-10-27","department_ids":["D100"]}'
+# 查询某部门榜单
+curl -X POST localhost:8000/departments/hotspot/query -H 'Content-Type: application/json' \
+  -d '{"date":"2026-10-27","department_id":"D100"}'
+```
+
+- 全公司与部门统计共用同日期的运行锁。重跑某天全公司后主题编号会变，请同时带上 `department_ids`，
+  或之后再调一次 `/departments/hotspot/run`。
+- 本地联调：`DEPARTMENT_MOCK_ENABLED=true`，在 `DEPARTMENT_MOCK_FILE` 写 `{"部门id": ["经理id", ...]}`，
+  `DEPARTMENT_ROSTER_URL=http://api:8000/mock/departments/managers`。
+- 已有库需手动执行 `sql/schema.sql` 中 `daily_hot_topics` 上方注释里的 `ALTER TABLE`；`daily_topic_catalog` 启动时自动建表。
+
 ## 经理×客户接触总结（两层：日笔记 → 月度总结）
 
 按“客户经理 + 客户”维度，生成近 1 个月的接触总结（沟通频次、主要话题、客户态度、

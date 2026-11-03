@@ -15,6 +15,7 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.db import get_session
 from app.models import DailyHotTopic
+from app.pipeline.persist import GLOBAL_SCOPE
 
 _TOP_K = 10  # 用于匹配的热词数
 
@@ -29,13 +30,15 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(a | b)
 
 
-def _load_prev(date_str: str) -> list[dict]:
+def _load_prev(date_str: str, scope: tuple[str, str]) -> list[dict]:
     prev_date = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
     session = get_session()
     try:
         rows = session.execute(
             select(DailyHotTopic.topic_id, DailyHotTopic.hot_words, DailyHotTopic.heat).where(
-                DailyHotTopic.stat_date == prev_date
+                DailyHotTopic.stat_date == prev_date,
+                DailyHotTopic.scope_type == scope[0],
+                DailyHotTopic.scope_id == scope[1],
             )
         ).all()
         return [
@@ -46,10 +49,14 @@ def _load_prev(date_str: str) -> list[dict]:
         session.close()
 
 
-def enrich_with_trend(date_str: str, results: list[dict]) -> int:
-    """给每条结果补 prev_heat / heat_change_pct / is_new / is_surge，返回突增条数。"""
+def enrich_with_trend(date_str: str, results: list[dict],
+                      scope: tuple[str, str] = GLOBAL_SCOPE) -> int:
+    """给每条结果补 prev_heat / heat_change_pct / is_new / is_surge，返回突增条数。
+
+    只与同一范围（全公司或同一部门）昨日的榜单比较。
+    """
     settings = get_settings()
-    prev = _load_prev(date_str)
+    prev = _load_prev(date_str, scope)
     used_prev: set[int] = set()
     surge_count = 0
 

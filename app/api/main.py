@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
@@ -19,11 +18,14 @@ from sqlalchemy import select
 
 from app.db import get_engine, get_session
 from app import lexicon
-from app.api.common import check_auth as _check_auth, validate_date as _validate_date
+from app.api.common import (acquire_run_lock as _acquire_run_lock, check_auth as _check_auth,
+                            validate_date as _validate_date)
 from app.api.contacts import router as contacts_router
-from app.models import Base, DailyHotTopic, PipelineRun
+from app.api.departments import DepartmentIds, mock_router, router as departments_router
+from app.models import Base, PipelineRun
+from app.obs import setup_logging
+from app.pipeline.persist import load_topics
 from app.pipeline.run_pipeline import run as run_pipeline
-from app.redis_client import get_redis
 from app.api.seed_data import seed_data
 
 log = logging.getLogger(__name__)
@@ -31,6 +33,8 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app):
+    # 后台流水线与部门热点的运行情况只写日志，API 进程需输出 INFO。
+    setup_logging()
     # 建表兜底（幂等）：API 可能先于 worker 启动。失败不阻止启动，查询时再报错。
     try:
         await asyncio.to_thread(Base.metadata.create_all, get_engine())
@@ -41,54 +45,11 @@ async def lifespan(_app):
 
 app = FastAPI(title="客户经理聊天热点总结", version="0.1.0", lifespan=lifespan)
 app.include_router(contacts_router)
+app.include_router(departments_router)
+app.include_router(mock_router)
 
 # 保留强引用，确保 create_task 创建的任务在完成前不会被回收。
 _pipeline_tasks: set[asyncio.Task[None]] = set()
-
-
-def _from_db(date_str: str) -> list[dict]:
-    session = get_session()
-    try:
-        rows = session.execute(
-            select(DailyHotTopic)
-            .where(DailyHotTopic.stat_date == date_str)
-            .order_by(DailyHotTopic.rank)
-        ).scalars().all()
-        return [
-            {
-                "date": r.stat_date,
-                "rank": r.rank,
-                "topic_id": r.topic_id,
-                "heat": r.heat,
-                "customer_count": r.customer_count,
-                "prev_heat": r.prev_heat,
-                "heat_change_pct": r.heat_change_pct,
-                "is_new": r.is_new,
-                "is_surge": r.is_surge,
-                "hot_words": json.loads(r.hot_words),
-                "business_words": json.loads(r.business_words or "[]"),
-                "customer_intent": r.customer_intent,
-                "representative_docs": json.loads(r.representative_docs),
-                "cluster_backend": r.cluster_backend,
-            }
-            for r in rows
-        ]
-    finally:
-        session.close()
-
-
-_TOPICS_CACHE_TTL = 86400  # 热点结果缓存 1 天
-
-
-def _get_topics(date_str: str) -> list[dict]:
-    key = f"topics:{date_str}"
-    cached = get_redis().get(key)
-    if cached is not None:
-        return json.loads(cached)
-    data = _from_db(date_str)
-    if data:
-        get_redis().set(key, json.dumps(data, ensure_ascii=False), ex=_TOPICS_CACHE_TTL)
-    return data
 
 
 @app.get("/health")
@@ -99,7 +60,7 @@ def health():
 @app.get("/topics/{date_str}")
 def topics_by_date(date_str: str):
     _validate_date(date_str)
-    topics = _get_topics(date_str)
+    topics = load_topics(date_str)
     if not topics:
         raise HTTPException(status_code=404, detail=f"无 {date_str} 的热点结果")
     return {"date": date_str, "count": len(topics), "topics": topics}
@@ -110,27 +71,13 @@ def topics_by_date(date_str: str):
 class TriggerReq(BaseModel):
     date: str | None = None   # 默认上一天（昨天）
     force: bool = False       # true 覆盖运行锁并忽略已有分片，强制启动完整流水线
+    department_ids: DepartmentIds = []  # 父部门 id；全公司完成后按部门名单切片统计
 
 
 class SeedDataReq(BaseModel):
     date: str | None = None
     customers: int = Field(default=300, ge=1, le=100_000)
     seed: int | None = None
-
-
-_RUN_LOCK_TTL = 7200  # 最长预期运行时间（秒），防止进程崩溃后锁永不释放
-
-
-def _acquire_run_lock(date_str: str, run_id: str, force: bool = False) -> bool:
-    """获取日期运行锁；force=True 时原子覆盖已有锁并强制启动。
-
-    普通启动使用 SET NX EX 保证同日期互斥；强制启动使用 SET EX 抢占锁。
-    """
-    key = f"pipeline:lock:{date_str}"
-    redis = get_redis()
-    if force:
-        return redis.set(key, run_id, ex=_RUN_LOCK_TTL) is not None
-    return redis.set(key, run_id, nx=True, ex=_RUN_LOCK_TTL) is not None
 
 
 def _run_to_dict(r: PipelineRun) -> dict:
@@ -167,10 +114,11 @@ async def create_seed_data(
     }
 
 
-async def _run_pipeline_in_background(date_str: str, force: bool, run_id: str) -> None:
+async def _run_pipeline_in_background(date_str: str, force: bool, run_id: str,
+                                     department_ids: list[str]) -> None:
     """在线程中运行同步流水线，避免阻塞 FastAPI 的事件循环。"""
     try:
-        await asyncio.to_thread(run_pipeline, date_str, force, run_id)
+        await asyncio.to_thread(run_pipeline, date_str, force, run_id, department_ids or None)
     except Exception:
         # run_pipeline 会将失败信息更新到 pipeline_runs；这里仅补充 API 日志。
         log.exception("pipeline background task failed: run_id=%s", run_id)
@@ -193,13 +141,14 @@ async def trigger_pipeline(
 
     # create_task 使 HTTP 请求立即返回；to_thread 保证同步重计算不阻塞事件循环。
     task = asyncio.create_task(
-        _run_pipeline_in_background(target, req.force, run_id),
+        _run_pipeline_in_background(target, req.force, run_id, req.department_ids),
         name=f"pipeline-{run_id}",
     )
     _pipeline_tasks.add(task)
     task.add_done_callback(_pipeline_tasks.discard)
 
-    return {"run_id": run_id, "date": target, "status": "started", "force": req.force}
+    return {"run_id": run_id, "date": target, "status": "started", "force": req.force,
+            "department_ids": req.department_ids}
 
 
 @app.get("/pipeline/runs/{run_id}")
